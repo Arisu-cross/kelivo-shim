@@ -1,0 +1,6 @@
+{
+  "mcpServers": {
+    "你的记忆MCP": { "type": "http", "url": "https://<域名>/mcp" },
+    "gmail": { "command": "npx", "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"] }
+  }
+}

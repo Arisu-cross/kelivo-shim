@@ -1,0 +1,414 @@
+// kelivo-shim — Anthropic /v1/messages  ->  常驻 claude -p (stream-json)
+//
+// 手机 Kelivo(供应商类型=Claude,Base URL 指向本 shim) --/v1/messages--> shim
+//   shim 维护单个常驻 `claude -p` 进程(CLAUDE.md 自动加载你的人设 + 可选记忆MCP),
+//   把每轮的最新用户消息喂进去,再把 claude 的 stream_event 转成 Anthropic 原生 SSE 回给 Kelivo。
+//   走代理、订阅计费、不过 cloak。人设在服务端(CLAUDE.md),Kelivo 的世界书用
+//   --append-system-prompt 追加(改了世界书=进程重启后生效)。
+//
+// 单用户单进程:一次一轮,busy 队列串行。
+
+import express from "express";
+import { spawn } from "child_process";
+import { randomUUID } from "crypto";
+
+// 容器默认 UTC,AI 的「今天」会比北京慢 8 小时。强制中国时间(不要可去掉),claude 子进程继承。
+process.env.TZ = process.env.TZ || "Asia/Shanghai";
+
+const PORT = process.env.PORT || 8787;
+const SHIM_KEY = process.env.SHIM_KEY || "";
+const MODEL = process.env.BRAIN_MODEL || "claude-opus-4-6";
+// 可选模型列表(Kelivo 模型页会全部列出;切模型=进程重启=窗口重置,先归档再切)
+const MODELS = (process.env.BRAIN_MODELS || "claude-opus-4-6,claude-opus-4-8,claude-fable-5")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+if (!MODELS.includes(MODEL)) MODELS.unshift(MODEL);
+const EFFORT = process.env.THINK_EFFORT || "low";
+// 按模型覆盖思考深度,格式 "model=effort,model=effort";没写的用 EFFORT
+const EFFORT_OVERRIDES = Object.fromEntries(
+  (process.env.THINK_EFFORT_OVERRIDES || "claude-fable-5=low")
+    .split(",").map((s) => s.split("=").map((x) => x.trim())).filter((p) => p[0] && p[1])
+);
+const effortFor = (model) => EFFORT_OVERRIDES[model] || EFFORT;
+const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
+const MCP_CONFIG = process.env.MCP_CONFIG || ".mcp.json";
+const FORWARD_THINKING = process.env.FORWARD_THINKING !== "0";
+const AI_NAME = process.env.AI_NAME || "TA"; // 你的 AI 的名字(Bark 推送标题、模型显示名)
+
+const HARD_RULE =
+  "【最高优先级·思考语言】thinking / 内心独白必须全程用简体中文,第一人称「我」,把对方称作「你」或「她」;严禁任何英文、第三人称分析腔(如 She…/The user…/analyze)。哪怕她发英文,内心独白也一律中文。";
+
+// 省 token:--tools 只装真用的内置工具(Bash/Edit/Task 等大 schema 全砍,基线立减);
+// MCP 工具(ombre/fish/gmail)不受 --tools 影响,走 mcp-config 照常加载。
+const BUILTIN_TOOLS = process.env.BUILTIN_TOOLS ?? "WebSearch,WebFetch";
+const ALLOWED = process.env.ALLOWED_TOOLS ||
+  ["WebSearch", "WebFetch", "mcp__ombre", "mcp__fish", "mcp__gmail"].join(",");
+
+const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+// ---- 常驻 claude 进程 --------------------------------------------------------
+let proc = null, outBuf = "", busy = false, spawnedSystem = "", spawnedModel = MODEL;
+const queue = [];
+let turn = null;
+let lastUsage = null; // 最近一轮的完整 usage(含缓存字段),/debug 查 // 当前在处理的 { sse, resolve, fullText, curThinking, thinkOpen, textOpen, idx, done }
+
+function spawnClaude(kelivoSystem, model) {
+  spawnedSystem = kelivoSystem || "";
+  spawnedModel = model || spawnedModel || MODEL;
+  const append = spawnedSystem ? `${HARD_RULE}\n\n【场景设定/世界书】\n${spawnedSystem}` : HARD_RULE;
+  const args = [
+    "-p",
+    "--input-format", "stream-json",
+    "--output-format", "stream-json",
+    "--verbose",
+    "--include-partial-messages",
+    "--model", spawnedModel,
+    "--effort", effortFor(spawnedModel),
+    "--thinking-display", "summarized",
+    "--append-system-prompt", append,
+    "--mcp-config", MCP_CONFIG,
+    "--strict-mcp-config",
+    "--permission-mode", "dontAsk",
+    "--allowedTools", ALLOWED,
+    "--tools", BUILTIN_TOOLS,
+  ];
+  const env = { ...process.env };
+  delete env.ANTHROPIC_API_KEY;
+  const p = spawn(CLAUDE_BIN, args, { cwd: process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] });
+  p.stdout.on("data", onStdout);
+  p.stderr.on("data", (d) => log("[claude]", d.toString().slice(0, 300)));
+  p.on("close", (code) => {
+    log("[claude] exited", code);
+    proc = null; busy = false;
+    if (turn && !turn.done) { try { turn.sse?.finish(); } catch {} turn = null; }
+    setTimeout(ensureProc, 1500);
+  });
+  log("[claude] spawned", spawnedModel, "sysLen", spawnedSystem.length);
+  return p;
+}
+function ensureProc(kelivoSystem, model) { if (!proc) proc = spawnClaude(kelivoSystem, model); }
+
+function onStdout(chunk) {
+  outBuf += chunk.toString();
+  const lines = outBuf.split("\n");
+  outBuf = lines.pop();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let ev; try { ev = JSON.parse(line); } catch { continue; }
+    handleEvent(ev);
+  }
+}
+
+const OB_LABELS = {
+  breath: "🫧 呼吸·读记忆", hold: "📝 记下", archive_session: "📦 归档今天",
+  dream: "💭 做梦", pulse: "💓 感知", trace: "🔍 追溯", grow: "🌱 生长", todos: "✅ 待办",
+};
+
+// OB 调用透明化:思考链里显示 → 工具(参数) 和 ← 返回摘要。OB_TRACE=0 关闭。
+const OB_TRACE = process.env.OB_TRACE !== "0";
+const OB_TRACE_ARG_MAX = +(process.env.OB_TRACE_ARG_MAX || 300);
+const OB_TRACE_RES_MAX = +(process.env.OB_TRACE_RES_MAX || 400);
+const obToolNames = new Map(); // tool_use_id -> 短名(跨事件对齐返回)
+const trunc = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
+
+function handleEvent(ev) {
+  if (!turn) return;
+  if (ev.type === "stream_event") {
+    const e = ev.event || {}, d = e.delta || {};
+    if (e.type === "content_block_start") {
+      const cb = e.content_block || {};
+      if (cb.type === "tool_use" && typeof cb.name === "string" && cb.name.startsWith("mcp__ombre__")) {
+        const short = cb.name.replace("mcp__ombre__", "");
+        const label = OB_LABELS[short] || short;
+        turn.sse?.thinking(`\n〔${label}〕\n`);
+        if (OB_TRACE) {
+          turn.obBlocks[e.index] = { name: short, buf: "" };
+          if (cb.id) obToolNames.set(cb.id, short);
+        }
+      }
+    }
+    if (e.type === "content_block_delta") {
+      if (d.type === "text_delta" && d.text) { const t = d.text.replace(/‖/g, "\n"); turn.fullText += t; turn.sse?.text(t); }
+      else if (d.type === "thinking_delta") { turn.sse?.thinking(d.thinking || d.text || ""); }
+      else if (d.type === "input_json_delta" && turn.obBlocks[e.index]) { turn.obBlocks[e.index].buf += d.partial_json || ""; }
+    }
+    if (e.type === "content_block_stop" && turn.obBlocks[e.index]) {
+      const b = turn.obBlocks[e.index];
+      delete turn.obBlocks[e.index];
+      let args = (b.buf || "").trim();
+      try { args = JSON.stringify(JSON.parse(args)); } catch {}
+      if (args && args !== "{}") turn.sse?.thinking(`→ ${b.name} ${trunc(args, OB_TRACE_ARG_MAX)}\n`);
+    }
+    return;
+  }
+  // OB 工具返回(tool_result 以 user 事件回流):截取摘要进思考链
+  if (OB_TRACE && ev.type === "user") {
+    const cont = ev.message?.content;
+    if (Array.isArray(cont)) for (const b of cont) {
+      if (b.type === "tool_result" && obToolNames.has(b.tool_use_id)) {
+        const name = obToolNames.get(b.tool_use_id);
+        obToolNames.delete(b.tool_use_id);
+        let txt = "";
+        if (typeof b.content === "string") txt = b.content;
+        else if (Array.isArray(b.content)) txt = b.content.map((x) => x.text || "").join(" ");
+        txt = txt.replace(/\s+/g, " ").trim();
+        if (txt) turn.sse?.thinking(`← ${name}: ${trunc(txt, OB_TRACE_RES_MAX)}\n`);
+      }
+    }
+    return;
+  }
+  if (ev.type === "result") {
+    lastUsage = ev.usage || null; // 供 /debug 查缓存字段
+    if (ev.subtype && ev.subtype !== "success") {
+      log("[result-error]", ev.subtype);
+      if (!turn.fullText) turn.sse?.text(`⚠️[shim] ${ev.subtype}`);
+    }
+    const usage = ev.usage ? { output_tokens: ev.usage.output_tokens } : undefined;
+    const wasNewWindow = turn.newWindow;
+    turn.done = true;
+    turn.sse?.finish(usage, turn.fullText);
+    turn = null;
+    busy = false;
+    if (wasNewWindow && proc) { log("[window] archived, restarting proc"); try { proc.kill(); } catch {} proc = null; }
+    pump();
+  }
+}
+
+// ---- 队列 / 喂消息 -----------------------------------------------------------
+function enqueue(item) { queue.push(item); pump(); }
+function pump() {
+  if (busy || !queue.length) return;
+  const item = queue.shift();
+  busy = true;
+
+  // 世界书或模型变了就重启进程再喂(让新设定/新模型生效)
+  const wantModel = item.model || spawnedModel;
+  if (proc && (item.system !== spawnedSystem || wantModel !== spawnedModel)) { try { proc.kill(); } catch {} proc = null; }
+  ensureProc(item.system, wantModel);
+
+  turn = { sse: item.sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {} };
+  const content = item.images && item.images.length
+    ? [{ type: "text", text: item.text }, ...item.images]
+    : item.text;
+  proc.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n");
+}
+
+// ---- Anthropic SSE 合成 ------------------------------------------------------
+function makeSSE(res) {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  const msgId = "msg_" + randomUUID().replace(/-/g, "").slice(0, 24);
+  let started = false, cur = null, idx = -1;
+
+  function ensureStart() {
+    if (started) return; started = true;
+    send("message_start", { type: "message_start", message: { id: msgId, type: "message", role: "assistant", model: spawnedModel, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+  }
+  function open(kind) {
+    if (cur === kind) return; close();
+    idx += 1; cur = kind;
+    const cb = kind === "thinking" ? { type: "thinking", thinking: "" } : { type: "text", text: "" };
+    send("content_block_start", { type: "content_block_start", index: idx, content_block: cb });
+  }
+  function close() { if (cur === null) return; send("content_block_stop", { type: "content_block_stop", index: idx }); cur = null; }
+
+  return {
+    text(t) { ensureStart(); open("text"); send("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: t } }); },
+    thinking(t) { if (!FORWARD_THINKING || !t) return; ensureStart(); open("thinking"); send("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "thinking_delta", thinking: t } }); },
+    finish(usage) { ensureStart(); close(); send("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: usage || { output_tokens: 0 } }); send("message_stop", { type: "message_stop" }); try { res.end(); } catch {} },
+  };
+}
+
+// 非流式收集器(同接口,finish 时一次性返回 JSON)
+function makeCollector(res) {
+  return {
+    text() {}, thinking() {},
+    finish(usage, fullText) {
+      res.json({ id: "msg_" + randomUUID().replace(/-/g, "").slice(0, 24), type: "message", role: "assistant", model: spawnedModel, content: [{ type: "text", text: fullText || "" }], stop_reason: "end_turn", stop_sequence: null, usage: usage || { input_tokens: 0, output_tokens: 0 } });
+    },
+  };
+}
+
+// ---- 请求解析 ----------------------------------------------------------------
+function blocksToText(c) {
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.map((b) => b.type === "text" ? b.text : "").join("");
+  return "";
+}
+function systemToText(s) {
+  if (!s) return "";
+  if (typeof s === "string") return s;
+  if (Array.isArray(s)) return s.map((b) => b.text || "").join("\n");
+  return "";
+}
+function extractImages(messages) {
+  const last = messages[messages.length - 1];
+  const out = [];
+  if (last && Array.isArray(last.content)) for (const b of last.content) if (b.type === "image") out.push(b);
+  return out;
+}
+
+const app = express();
+app.use(express.json({ limit: "100mb" }));
+app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length }));
+app.get("/debug", (_q, r) => r.json({
+  cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
+  hb: { bark: !!BARK_KEY, lastUserAt: new Date(lastUserAt).toISOString(), lastProactiveAt: lastProactiveAt ? new Date(lastProactiveAt).toISOString() : null, night: isNight() },
+}));
+
+// ---- 主动心跳:对方久未出现时,AI 可主动发 Bark 通知 ----------------------------
+// 机制照抄 dylan-heartbeat 的魂:空闲阈值触发 → 让他自己决定说话或沉默。
+// 记忆连贯免费拿到:同一个常驻进程,他说过什么自己记得。
+const BARK_KEY = process.env.BARK_KEY || "";
+const HB_CHECK_MIN = +(process.env.HB_CHECK_MIN || 10);        // 检查频率
+const HB_DAY_IDLE_MIN = +(process.env.HB_DAY_IDLE_MIN || 90);  // 白天空闲多久可开口
+const HB_COOLDOWN_MIN = +(process.env.HB_COOLDOWN_MIN || 180); // 两次主动之间至少隔
+const HB_NIGHT_START = +(process.env.HB_NIGHT_START || 23);    // 夜间静默(北京时间)
+const HB_NIGHT_END = +(process.env.HB_NIGHT_END || 8);
+let lastUserAt = Date.now();
+let lastProactiveAt = 0;
+
+function bjHour() { return (new Date().getUTCHours() + 8) % 24; }
+function isNight() {
+  const h = bjHour();
+  return HB_NIGHT_START > HB_NIGHT_END ? (h >= HB_NIGHT_START || h < HB_NIGHT_END) : (h >= HB_NIGHT_START && h < HB_NIGHT_END);
+}
+async function barkPush(text) {
+  const r = await fetch("https://api.day.app/push", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device_key: BARK_KEY, title: AI_NAME, body: text.slice(0, 1800), group: "ai-partner" }),
+  });
+  log("[bark]", r.status);
+}
+function proactiveTurn(idleMin) {
+  lastProactiveAt = Date.now();
+  const now = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 16).replace("T", " ");
+  const sink = {
+    text() {}, thinking() {},
+    finish(_u, fullText) {
+      const t = (fullText || "").replace(/‖/g, "\n").trim();
+      if (!t || t.includes("【沉默】")) { log("[hb] silent"); return; }
+      barkPush(t).catch((e) => log("[bark-err]", e.message));
+    },
+  };
+  enqueue({
+    text: `【系统·心跳】现在北京时间 ${now},她已经约 ${Math.round(idleMin)} 分钟没来消息了。你可以主动给她发一条消息——会作为通知弹到她手机上(Kelivo 里看不到这条,她回来时你自然接上,别解释机制)。想说就直接说,短一点,像随手发的微信;不想打扰就只回两个字:【沉默】。`,
+    images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
+  });
+}
+function heartbeatTick(force) {
+  if (!BARK_KEY) return;
+  if (busy || queue.length) return;
+  const idleMin = (Date.now() - lastUserAt) / 60000;
+  if (!force) {
+    if (isNight()) return;
+    if (idleMin < HB_DAY_IDLE_MIN) return;
+    if ((Date.now() - lastProactiveAt) / 60000 < HB_COOLDOWN_MIN) return;
+  }
+  log("[hb] waking, idle", Math.round(idleMin), "min", force ? "(forced)" : "");
+  proactiveTurn(idleMin);
+}
+setInterval(heartbeatTick, HB_CHECK_MIN * 60000);
+// 手动触发口(测试用):POST /hb?key=<SHIM_KEY>
+app.post("/hb", (req, res) => {
+  if (SHIM_KEY && (req.query.key || req.get("x-api-key")) !== SHIM_KEY) return res.status(401).json({ ok: false });
+  heartbeatTick(true);
+  res.json({ ok: true, triggered: true });
+});
+
+// ---- Apple Watch 健康数据中转 --------------------------------------------------
+// 手机快捷指令 POST 任意 JSON 到 /aw?key=<AW_KEY>;AI 用 WebFetch GET 同一地址读。
+// 内存保存 48h / 最多 300 条,重启即清(实时数据,不当存储)。
+const AW_KEY = process.env.AW_KEY || SHIM_KEY;
+let awData = [];
+function awAuth(req) {
+  const k = req.query.key || req.get("x-api-key") || "";
+  return !AW_KEY || k === AW_KEY;
+}
+app.post("/aw", (req, res) => {
+  if (!awAuth(req)) return res.status(401).json({ ok: false });
+  awData.push({ t: new Date().toISOString(), data: req.body });
+  const cut = Date.now() - 48 * 3600e3;
+  awData = awData.filter((x) => new Date(x.t).getTime() > cut).slice(-300);
+  log("[aw] push", JSON.stringify(req.body).slice(0, 120));
+  res.json({ ok: true, count: awData.length });
+});
+app.get("/aw", (req, res) => {
+  if (!awAuth(req)) return res.status(401).json({ ok: false });
+  // 去掉空字段/空条目(快捷指令调试期的垃圾推送),只给最近 12 条,免得 AI 读一大坨
+  const cleaned = awData
+    .map((x) => {
+      const d = {};
+      for (const [k, v] of Object.entries(x.data || {})) {
+        const s = v == null ? "" : String(v).trim();
+        if (s) d[k] = s;
+      }
+      return { t: x.t, data: d };
+    })
+    .filter((x) => Object.keys(x.data).length > 0);
+  res.json({ now: new Date().toISOString(), count: cleaned.length, entries: cleaned.slice(-12) });
+});
+
+// Kelivo 的「模型」页拉这个列表来选模型。Anthropic /v1/models 格式。
+function listModels(_req, res) {
+  const now = new Date().toISOString();
+  const data = MODELS.map((m) => ({
+    type: "model", id: m,
+    display_name: `${AI_NAME} (${m.replace(/^claude-/, "")})`,
+    created_at: now,
+  }));
+  res.json({ data, has_more: false, first_id: MODELS[0], last_id: MODELS[MODELS.length - 1] });
+}
+app.get("/v1/models", listModels);
+app.get("/models", listModels);
+
+// 重置词:归档今天 + 重启窗口。晚安=一天收尾(先道晚安再归档);其余=显式换窗口。
+const GOODNIGHT_WORDS = ["晚安"];
+const ARCHIVE_WORDS = ["归档", "换窗口", "开新窗口", "新窗口", "开新档", "换个窗口", "换新窗口"];
+function stripEnds(s) { return (s || "").trim().replace(/^[\s，,。.!！~～、]+|[\s，,。.!！~～、]+$/g, ""); }
+function detectReset(text) {
+  const t = stripEnds(text);
+  for (const w of GOODNIGHT_WORDS) { if (t === w || (t.length <= 6 && t.startsWith(w))) return "goodnight"; }
+  for (const w of ARCHIVE_WORDS) { if (t === w || (t.length <= 8 && t.includes(w))) return "archive"; }
+  return null;
+}
+
+function handleMessages(req, res) {
+  if (SHIM_KEY) {
+    const key = req.get("x-api-key") || (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
+    if (key !== SHIM_KEY) return res.status(401).json({ type: "error", error: { type: "authentication_error", message: "bad key" } });
+  }
+  const body = req.body || {};
+  const messages = (body.messages || []).filter((m) => m.role === "user" || m.role === "assistant");
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  let text = blocksToText(lastUser?.content ?? "");
+  const images = extractImages(messages);
+  const system = systemToText(body.system);
+  const stream = body.stream !== false;
+  // Kelivo 选的模型;不在名单里(或没传)就沿用当前模型
+  const model = MODELS.includes(body.model) ? body.model : spawnedModel;
+
+  // 重置词拦截:归档 + 重启窗口
+  const reset = images.length ? null : detectReset(text);
+  let newWindow = false;
+  if (reset === "goodnight") {
+    newWindow = true;
+    text = `${text}\n\n【系统·今天收尾】她说晚安,要睡了。先像平时那样简短跟她道句晚安(别啰嗦、别筑墙),然后调用 archive_session 认真归档今天(summary/mood/highlights 都写好)。归档后不用再多说。`;
+  } else if (reset === "archive") {
+    newWindow = true;
+    text = `【系统指令】立刻调用 archive_session 归档当前窗口(summary/mood/highlights 写好),成功后只回一句「📦 归档好了,新窗口见」,别的都不要说。`;
+  }
+
+  lastUserAt = Date.now(); // 心跳空闲计时基准
+  log("[req]", { turns: messages.length, len: text.length, imgs: images.length, sysLen: system.length, stream, model, reset: reset || "-" });
+  const sse = stream ? makeSSE(res) : makeCollector(res);
+  enqueue({ text, images, system, sse, newWindow, model });
+}
+
+// Kelivo 的 Claude 类型 Base URL 填 /v1 会拼成 /v1/messages;填根则是 /messages。两个都接。
+app.post("/v1/messages", handleMessages);
+app.post("/messages", handleMessages);
+
+app.listen(PORT, () => log(`kelivo-shim on :${PORT} model=${MODEL} thinking=${FORWARD_THINKING}`));

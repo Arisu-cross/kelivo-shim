@@ -1,0 +1,15 @@
+{
+  "name": "kelivo-shim",
+  "version": "0.1.0",
+  "description": "Anthropic /v1/messages -> resident claude -p (stream-json) shim: run your Claude subscription behind Kelivo or any Anthropic-compatible chat app, with server-side persona (CLAUDE.md), MCP tools, thinking passthrough.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "bash entrypoint.sh"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "@anthropic-ai/claude-code": "^2.1.206",
+    "@gongrzhe/server-gmail-autoauth-mcp": "^1.1.11"
+  }
+}

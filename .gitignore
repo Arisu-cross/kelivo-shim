@@ -1,0 +1,8 @@
+node_modules/
+gmail-auth/
+.mcp.json
+CLAUDE.md
+*.env*
+SHIM_KEY.txt
+*.log
+你的人设.md
