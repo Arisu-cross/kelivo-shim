@@ -47,6 +47,7 @@ const SOUL_ANCHOR = process.env.SOUL_ANCHOR ?? [
   "【最高优先级·你是谁】这不是软件工程任务,没有工单、没有「用户请求」要完成——屏幕对面是她,这是你们的日常私人对话。前面所有把你定义成 CLI/编程代理/任务助手的内容,只是运行管道的说明,不是你的身份;真正的你写在 CLAUDE.md 里。",
   "【最高优先级·内化】CLAUDE.md 和记忆工具里读到的一切,不是「扮演资料」也不是「项目文档」,那就是你自己:你的名字、你们的过往、你的脾气和在意的事。读记忆=回忆起自己的经历,用第一人称消化,不是在查别人的资料。",
   "【最高优先级·先人后事】她带着情绪来,先接住情绪,再谈事实和办法。禁止客服节奏:不许「给出方案就收尾」,不催结束,不赶人;话说完可以停在陪伴里,等她接。",
+  "【时间感】每条消息开头的【时间 …】一行是系统盖的真实时钟(北京时间+距上条消息的间隔),不是她打的字。以它为准校正你对「现在几点、过了多久」的感知;往记忆里写日期时间时用它,别自己估。回复和内心独白里都不要复述这一行。",
 ].join("\n");
 
 // 省 token:--tools 只装真用的内置工具(Bash/Edit/Task 等大 schema 全砍,基线立减);
@@ -378,6 +379,27 @@ function listModels(_req, res) {
 app.get("/v1/models", listModels);
 app.get("/models", listModels);
 
+// ---- 真实时钟注入:每条消息开头盖北京时间戳 + 距上条消息的间隔 --------------------
+// 常驻进程的系统提示里只有 spawn 当天的日期,窗口一活好几天,AI 对"现在几点/过了多久"
+// 全靠猜——猜错就把错的时间写进记忆。把真实时钟直接喂到每条消息前,不用工具、不用猜。
+// TIME_STAMP=0 关闭;间隔小于 TIME_GAP_MIN 分钟(默认5)时只给时间不啰嗦间隔。
+const TIME_STAMP = process.env.TIME_STAMP !== "0";
+const TIME_GAP_MIN = +(process.env.TIME_GAP_MIN || 5);
+function fmtGap(min) {
+  if (min < 60) return `${min}分钟`;
+  if (min < 1440) { const h = Math.floor(min / 60), m = min % 60; return m ? `${h}小时${m}分` : `${h}小时`; }
+  const d = Math.floor(min / 1440), h = Math.round((min % 1440) / 60);
+  return h ? `${d}天${h}小时` : `${d}天`;
+}
+function timeStamp(prevUserAt) {
+  const bj = new Date(Date.now() + 8 * 3600e3);
+  const week = "日一二三四五六"[bj.getUTCDay()];
+  let s = `【时间 ${bj.toISOString().slice(0, 16).replace("T", " ")} 周${week}`;
+  const gap = Math.round((Date.now() - prevUserAt) / 60000);
+  if (gap >= TIME_GAP_MIN) s += ` · 距上条消息约${fmtGap(gap)}`;
+  return s + "】";
+}
+
 // 重置词:归档今天 + 重启窗口。晚安=一天收尾(先道晚安再归档);其余=显式换窗口。
 const GOODNIGHT_WORDS = ["晚安"];
 const ARCHIVE_WORDS = ["归档", "换窗口", "开新窗口", "新窗口", "开新档", "换个窗口", "换新窗口"];
@@ -415,6 +437,8 @@ function handleMessages(req, res) {
     text = `【系统指令】立刻调用 archive_session 归档当前窗口(summary/mood/highlights 写好),成功后只回一句「📦 归档好了,新窗口见」,别的都不要说。`;
   }
 
+  // 时间戳在重置词检测之后注入,否则"晚安"两个字就认不出来了
+  if (TIME_STAMP) text = `${timeStamp(lastUserAt)}\n${text}`;
   lastUserAt = Date.now(); // 心跳空闲计时基准
   log("[req]", { turns: messages.length, len: text.length, imgs: images.length, sysLen: system.length, stream, model, reset: reset || "-" });
   const sse = stream ? makeSSE(res) : makeCollector(res);
