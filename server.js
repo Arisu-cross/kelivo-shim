@@ -272,6 +272,7 @@ app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
   wake: {
     bark: !!BARK_KEY,
+    tg: !!TG_TOKEN, tgLocked: !!tgChatId,
     lastUserAt: new Date(lastUserAt).toISOString(),
     lastTurnAt: new Date(lastTurnAt).toISOString(),
     lastSpokeAt: lastSpokeAt ? new Date(lastSpokeAt).toISOString() : null,
@@ -305,7 +306,10 @@ function wakeTurn(idleUserMin) {
   const sinceSpoke = lastSpokeAt
     ? `,你上次主动开口是约 ${Math.round((Date.now() - lastSpokeAt) / 60000)} 分钟前`
     : "";
-  const speakLine = BARK_KEY
+  const canTg = !!(TG_TOKEN && tgChatId);
+  const speakLine = canTg
+    ? "想跟她说点什么就直接说——会直接出现在你们的 Telegram 对话里(她可能开着勿扰或在忙,别期待立刻回复);像随手发的微信,频率你自己把握。"
+    : BARK_KEY
     ? "想跟她说点什么就直接说——会作为通知弹到她手机(Kelivo 里看不到这条,她回来时你自然接上,别解释机制;她可能开着勿扰或在忙,别期待立刻回复);说话像随手发的微信,频率你自己把握。"
     : "(当前没有配置推送渠道,说了她也收不到。)";
   const sink = {
@@ -314,7 +318,8 @@ function wakeTurn(idleUserMin) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
       if (!t || t.includes("【沉默】")) { log("[wake] silent"); return; }
       lastSpokeAt = Date.now();
-      if (BARK_KEY) barkPush(t).catch((e) => log("[bark-err]", e.message));
+      if (canTg) tgSend(t).catch((e) => log("[tg-err]", e.message));
+      else if (BARK_KEY) barkPush(t).catch((e) => log("[bark-err]", e.message));
     },
   };
   enqueue({
@@ -336,6 +341,78 @@ app.post("/hb", (req, res) => {
   wakeTick(true);
   res.json({ ok: true, triggered: true });
 });
+
+// ---- Telegram 前端(与 Kelivo 并行,同一个常驻进程=同一个他) --------------------
+// 收消息走 submitTurn 同一条队列;回复与自主发言直接 sendMessage——
+// Telegram bot 天生可主动开口,这是 Kelivo(纯请求-响应)做不到的。
+// TG_BOT_TOKEN 启用;TG_CHAT_ID 可预设,不设则第一个私聊自动锁定(之后只认这一个人)。
+const TG_TOKEN = process.env.TG_BOT_TOKEN || "";
+let tgChatId = +(process.env.TG_CHAT_ID || 0);
+let tgOffset = 0;
+
+async function tgApi(method, payload) {
+  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+  return r.json();
+}
+async function tgSend(text) {
+  if (!tgChatId || !text) return;
+  for (let i = 0; i < text.length; i += 4000) {  // TG 单条上限 4096
+    const j = await tgApi("sendMessage", { chat_id: tgChatId, text: text.slice(i, i + 4000) });
+    if (!j.ok) log("[tg-send-err]", JSON.stringify(j).slice(0, 200));
+  }
+}
+async function tgFetchPhoto(m) {
+  // 取最大尺寸的那张;下载转 base64 image block
+  try {
+    const ph = m.photo[m.photo.length - 1];
+    const gf = await tgApi("getFile", { file_id: ph.file_id });
+    if (!gf.ok) return null;
+    const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${gf.result.file_path}`);
+    const buf = Buffer.from(await r.arrayBuffer());
+    return { type: "image", source: { type: "base64", media_type: "image/jpeg", data: buf.toString("base64") } };
+  } catch (e) { log("[tg-photo-err]", e.message); return null; }
+}
+async function handleTgMessage(m) {
+  if (!m.chat || m.chat.type !== "private") return;
+  if (!tgChatId) { tgChatId = m.chat.id; log("[tg] chat locked:", tgChatId); }
+  else if (m.chat.id !== tgChatId) return; // 单用户:只认锁定的那个人
+  const text = (m.text || m.caption || "").trim();
+  const images = [];
+  if (m.photo && m.photo.length) { const img = await tgFetchPhoto(m); if (img) images.push(img); }
+  if (!text && !images.length) return;
+  // 生成回复期间维持「正在输入…」
+  const typing = setInterval(() => tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {}), 4500);
+  tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {});
+  const sink = {
+    text() {}, thinking() {},
+    finish(_u, fullText) {
+      clearInterval(typing);
+      const t = (fullText || "").replace(/‖/g, "\n").trim();
+      tgSend(t || "…").catch((e) => log("[tg-err]", e.message));
+    },
+  };
+  submitTurn(text, images, sink, { src: "telegram" });
+}
+async function tgPoll() {
+  log("[tg] long-poll started");
+  while (true) {
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=50&offset=${tgOffset}`,
+        { signal: AbortSignal.timeout(65000) });
+      const j = await r.json();
+      if (j.ok) for (const u of j.result) {
+        tgOffset = u.update_id + 1;
+        if (u.message) await handleTgMessage(u.message);
+      }
+    } catch (e) {
+      log("[tg-poll-err]", e.message);
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+}
+if (TG_TOKEN) tgPoll();
 
 // ---- Apple Watch 健康数据中转 --------------------------------------------------
 // 手机快捷指令 POST 任意 JSON 到 /aw?key=<AW_KEY>;AI 用 WebFetch GET 同一地址读。
@@ -415,22 +492,8 @@ function detectReset(text) {
   return null;
 }
 
-function handleMessages(req, res) {
-  if (SHIM_KEY) {
-    const key = req.get("x-api-key") || (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
-    if (key !== SHIM_KEY) return res.status(401).json({ type: "error", error: { type: "authentication_error", message: "bad key" } });
-  }
-  const body = req.body || {};
-  const messages = (body.messages || []).filter((m) => m.role === "user" || m.role === "assistant");
-  const lastUser = [...messages].reverse().find((m) => m.role === "user");
-  let text = blocksToText(lastUser?.content ?? "");
-  const images = extractImages(messages);
-  const system = systemToText(body.system);
-  const stream = body.stream !== false;
-  // Kelivo 选的模型;不在名单里(或没传)就沿用当前模型
-  const model = MODELS.includes(body.model) ? body.model : spawnedModel;
-
-  // 重置词拦截:归档 + 重启窗口
+// Kelivo 与 Telegram 共用的进队逻辑:重置词 → 时间戳 → enqueue
+function submitTurn(text, images, sink, opts = {}) {
   const reset = images.length ? null : detectReset(text);
   let newWindow = false;
   if (reset === "goodnight") {
@@ -440,13 +503,29 @@ function handleMessages(req, res) {
     newWindow = true;
     text = `【系统指令】立刻调用 archive_session 归档当前窗口(summary/mood/highlights 写好),成功后只回一句「📦 归档好了,新窗口见」,别的都不要说。`;
   }
-
   // 时间戳在重置词检测之后注入,否则"晚安"两个字就认不出来了
   if (TIME_STAMP) text = `${timeStamp(lastUserAt)}\n${text}`;
-  lastUserAt = Date.now(); // 心跳空闲计时基准
-  log("[req]", { turns: messages.length, len: text.length, imgs: images.length, sysLen: system.length, stream, model, reset: reset || "-" });
+  lastUserAt = Date.now(); // 自主时间空闲计时基准
+  log("[turn]", { src: opts.src || "kelivo", len: text.length, imgs: images.length, reset: reset || "-" });
+  enqueue({ text, images, system: opts.system ?? spawnedSystem, sse: sink, newWindow, model: opts.model || spawnedModel });
+}
+
+function handleMessages(req, res) {
+  if (SHIM_KEY) {
+    const key = req.get("x-api-key") || (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
+    if (key !== SHIM_KEY) return res.status(401).json({ type: "error", error: { type: "authentication_error", message: "bad key" } });
+  }
+  const body = req.body || {};
+  const messages = (body.messages || []).filter((m) => m.role === "user" || m.role === "assistant");
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  const text = blocksToText(lastUser?.content ?? "");
+  const images = extractImages(messages);
+  const system = systemToText(body.system);
+  const stream = body.stream !== false;
+  // Kelivo 选的模型;不在名单里(或没传)就沿用当前模型
+  const model = MODELS.includes(body.model) ? body.model : spawnedModel;
   const sse = stream ? makeSSE(res) : makeCollector(res);
-  enqueue({ text, images, system, sse, newWindow, model });
+  submitTurn(text, images, sse, { system, model, src: "kelivo" });
 }
 
 // Kelivo 的 Claude 类型 Base URL 填 /v1 会拼成 /v1/messages;填根则是 /messages。两个都接。
