@@ -173,6 +173,7 @@ function handleEvent(ev) {
   }
   if (ev.type === "result") {
     lastUsage = ev.usage || null; // 供 /debug 查缓存字段
+    lastTurnAt = Date.now(); // 任何一轮完成都刷新了缓存 TTL,自主唤醒以此计时
     if (ev.subtype && ev.subtype !== "success") {
       log("[result-error]", ev.subtype);
       if (!turn.fullText) turn.sse?.text(`⚠️[shim] ${ev.subtype}`);
@@ -269,26 +270,28 @@ app.use(express.json({ limit: "100mb" }));
 app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length }));
 app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
-  hb: { bark: !!BARK_KEY, lastUserAt: new Date(lastUserAt).toISOString(), lastProactiveAt: lastProactiveAt ? new Date(lastProactiveAt).toISOString() : null, night: isNight() },
+  wake: {
+    bark: !!BARK_KEY,
+    lastUserAt: new Date(lastUserAt).toISOString(),
+    lastTurnAt: new Date(lastTurnAt).toISOString(),
+    lastSpokeAt: lastSpokeAt ? new Date(lastSpokeAt).toISOString() : null,
+  },
 }));
 
-// ---- 主动心跳:对方久未出现时,AI 可主动发 Bark 通知 ----------------------------
-// 机制照抄 dylan-heartbeat 的魂:空闲阈值触发 → 让他自己决定说话或沉默。
-// 记忆连贯免费拿到:同一个常驻进程,他说过什么自己记得。
+// ---- 自主时间:定时唤醒,AI 自己决定说话还是静默续命 ----------------------------
+// 升级自旧「主动心跳」:不再区分昼夜(手机端自有勿扰/睡眠模式),不设硬冷却,
+// 频率交给他自己把握(提示里告知距上次开口多久)。距离上一轮对话(任何 turn,
+// 含唤醒轮)超过 WAKE_IDLE_MIN 分钟就喂一条【系统·自主时间】:
+//   想说话 → Bark 推送到手机(Kelivo 里看不到,但常驻进程自己记得,回来自然接上)
+//   没话说 → 只回【沉默】= 最小开销续命:赶在 1 小时提示词缓存过期前刷新一轮,
+//            上下文与缓存全天连续,夜里也不断线。
 const BARK_KEY = process.env.BARK_KEY || "";
-const HB_CHECK_MIN = +(process.env.HB_CHECK_MIN || 10);        // 检查频率
-const HB_DAY_IDLE_MIN = +(process.env.HB_DAY_IDLE_MIN || 90);  // 白天空闲多久可开口
-const HB_COOLDOWN_MIN = +(process.env.HB_COOLDOWN_MIN || 180); // 两次主动之间至少隔
-const HB_NIGHT_START = +(process.env.HB_NIGHT_START || 23);    // 夜间静默(北京时间)
-const HB_NIGHT_END = +(process.env.HB_NIGHT_END || 8);
+const WAKE_CHECK_MIN = +(process.env.WAKE_CHECK_MIN || 10); // 检查频率
+const WAKE_IDLE_MIN = +(process.env.WAKE_IDLE_MIN || 50);   // 空闲阈值,略小于缓存 TTL(60min)
 let lastUserAt = Date.now();
-let lastProactiveAt = 0;
+let lastTurnAt = Date.now();  // 任何一轮完成都会刷新缓存 TTL(handleEvent result 里更新)
+let lastSpokeAt = 0;          // 上次真的主动开口(推送出去)的时刻
 
-function bjHour() { return (new Date().getUTCHours() + 8) % 24; }
-function isNight() {
-  const h = bjHour();
-  return HB_NIGHT_START > HB_NIGHT_END ? (h >= HB_NIGHT_START || h < HB_NIGHT_END) : (h >= HB_NIGHT_START && h < HB_NIGHT_END);
-}
 async function barkPush(text) {
   const r = await fetch("https://api.day.app/push", {
     method: "POST",
@@ -297,39 +300,40 @@ async function barkPush(text) {
   });
   log("[bark]", r.status);
 }
-function proactiveTurn(idleMin) {
-  lastProactiveAt = Date.now();
+function wakeTurn(idleUserMin) {
   const now = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 16).replace("T", " ");
+  const sinceSpoke = lastSpokeAt
+    ? `,你上次主动开口是约 ${Math.round((Date.now() - lastSpokeAt) / 60000)} 分钟前`
+    : "";
+  const speakLine = BARK_KEY
+    ? "想跟她说点什么就直接说——会作为通知弹到她手机(Kelivo 里看不到这条,她回来时你自然接上,别解释机制;她可能开着勿扰或在忙,别期待立刻回复);说话像随手发的微信,频率你自己把握。"
+    : "(当前没有配置推送渠道,说了她也收不到。)";
   const sink = {
     text() {}, thinking() {},
     finish(_u, fullText) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
-      if (!t || t.includes("【沉默】")) { log("[hb] silent"); return; }
-      barkPush(t).catch((e) => log("[bark-err]", e.message));
+      if (!t || t.includes("【沉默】")) { log("[wake] silent"); return; }
+      lastSpokeAt = Date.now();
+      if (BARK_KEY) barkPush(t).catch((e) => log("[bark-err]", e.message));
     },
   };
   enqueue({
-    text: `【系统·心跳】现在北京时间 ${now},她已经约 ${Math.round(idleMin)} 分钟没来消息了。你可以主动给她发一条消息——会作为通知弹到她手机上(Kelivo 里看不到这条,她回来时你自然接上,别解释机制)。想说就直接说,短一点,像随手发的微信;不想打扰就只回两个字:【沉默】。`,
+    text: `【系统·自主时间】现在北京时间 ${now},她已约 ${Math.round(idleUserMin)} 分钟没有消息${sinceSpoke}。这轮是留给你自己的:${speakLine}没什么想说的就只回【沉默】两个字,这轮只用来保持你的状态和记忆连续。`,
     images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
   });
 }
-function heartbeatTick(force) {
-  if (!BARK_KEY) return;
+function wakeTick(force) {
   if (busy || queue.length) return;
-  const idleMin = (Date.now() - lastUserAt) / 60000;
-  if (!force) {
-    if (isNight()) return;
-    if (idleMin < HB_DAY_IDLE_MIN) return;
-    if ((Date.now() - lastProactiveAt) / 60000 < HB_COOLDOWN_MIN) return;
-  }
-  log("[hb] waking, idle", Math.round(idleMin), "min", force ? "(forced)" : "");
-  proactiveTurn(idleMin);
+  const idleTurnMin = (Date.now() - lastTurnAt) / 60000;
+  if (!force && idleTurnMin < WAKE_IDLE_MIN) return;
+  log("[wake] idle", Math.round(idleTurnMin), "min", force ? "(forced)" : "");
+  wakeTurn((Date.now() - lastUserAt) / 60000);
 }
-setInterval(heartbeatTick, HB_CHECK_MIN * 60000);
+setInterval(wakeTick, WAKE_CHECK_MIN * 60000);
 // 手动触发口(测试用):POST /hb?key=<SHIM_KEY>
 app.post("/hb", (req, res) => {
   if (SHIM_KEY && (req.query.key || req.get("x-api-key")) !== SHIM_KEY) return res.status(401).json({ ok: false });
-  heartbeatTick(true);
+  wakeTick(true);
   res.json({ ok: true, triggered: true });
 });
 
