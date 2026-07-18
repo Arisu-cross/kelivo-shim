@@ -5,7 +5,8 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "bash entrypoint.sh"
+    "start": "bash entrypoint.sh",
+    "test": "node --test"
   },
   "dependencies": {
     "express": "^4.19.2",

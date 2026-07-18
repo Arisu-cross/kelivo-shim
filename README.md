@@ -24,7 +24,8 @@
 
 | 文件 | 说明 |
 |---|---|
-| `server.js` | shim 本体:Anthropic SSE ↔ 常驻 claude -p,含重置词、心跳、健康数据中转、多模型、OB 调用透明化 |
+| `server.js` | shim 本体:Anthropic SSE ↔ 常驻 claude -p,含重置词、心跳、健康数据中转、多模型、OB 调用透明化、Telegram 前端 |
+| `voice.js` | Telegram 语音:`[语音]…[/语音]` 标记解析 + ElevenLabs TTS(失败自动降级发文字) |
 | `entrypoint.sh` | 容器启动脚本(补装 claude 原生二进制等) |
 | `package.json` | 依赖 |
 | `.mcp.json.example` | MCP 工具清单模板,复制成 `.mcp.json` 填你的 |
