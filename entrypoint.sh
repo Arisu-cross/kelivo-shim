@@ -27,6 +27,31 @@ if [ -n "$ELEVENLABS_API_KEY" ] && ! command -v ffmpeg >/dev/null 2>&1; then
     || echo "[entrypoint] ffmpeg install failed; voice works only if opus-direct is available"
 fi
 
+# ---- Personal-file self-heal ------------------------------------------------
+# CLAUDE.md / 你的人设.md / .mcp.json / gmail-auth/ are gitignored, so any clean
+# redeploy (git auto-deploy, fresh sandbox upload) ships WITHOUT them — persona
+# gone, memory MCP unreachable. Env vars DO survive Zeabur redeploys: stash the
+# files there once and every boot self-heals.
+#   PERSONA_TGZ_B64  base64(tar.gz) of the personal files, unpacked into the
+#                    workdir. Files already on disk win (a freshly uploaded copy
+#                    beats the stash). Build it with:
+#                    tar czf - CLAUDE.md 你的人设.md gmail-auth 2>/dev/null | base64 -w0
+#   MCP_JSON         raw JSON content for .mcp.json (small enough to keep plain)
+if [ -n "$PERSONA_TGZ_B64" ]; then
+  tmp="$(mktemp -d)"
+  if printf '%s' "$PERSONA_TGZ_B64" | base64 -d 2>/dev/null | tar xz -C "$tmp" 2>/dev/null; then
+    cp -rn "$tmp"/. . 2>/dev/null || true
+    echo "[entrypoint] personal files restored from PERSONA_TGZ_B64 (existing files kept)"
+  else
+    echo "[entrypoint] WARNING: PERSONA_TGZ_B64 set but decode/unpack failed"
+  fi
+  rm -rf "$tmp"
+fi
+if [ ! -f .mcp.json ] && [ -n "$MCP_JSON" ]; then
+  printf '%s' "$MCP_JSON" > .mcp.json
+  echo "[entrypoint] .mcp.json restored from MCP_JSON env"
+fi
+
 # Gmail MCP: creds uploaded in gmail-auth/ (non-dot dir survives upload); server
 # reads them from ~/.gmail-mcp/. Pre-install so npx resolves without a cold download.
 if [ -d gmail-auth ]; then
@@ -43,6 +68,17 @@ if [ ! -f .mcp.json ]; then
   "gmail": { "command": "npx", "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"] }
 } }
 JSON
+fi
+
+# Loud boot check: these two are exactly what dies on a clean redeploy, and the
+# failure is otherwise silent (AI just "forgets who it is" / loses memory tools).
+if [ ! -f CLAUDE.md ]; then
+  echo "[entrypoint] ⚠️ WARNING: CLAUDE.md missing — persona will NOT load."
+  echo "[entrypoint]    Redeploy wiped it? Re-upload it or set PERSONA_TGZ_B64 (see docs §3.6)."
+fi
+if grep -q '<你的' .mcp.json 2>/dev/null; then
+  echo "[entrypoint] ⚠️ WARNING: .mcp.json is a placeholder — memory/MCP tools will NOT connect."
+  echo "[entrypoint]    Re-upload the real one or set MCP_JSON (see docs §3.6)."
 fi
 
 # Trust the workspace so CLAUDE.md loads cleanly (permissions come from --allowedTools).

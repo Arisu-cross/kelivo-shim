@@ -11,6 +11,7 @@
 import express from "express";
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
+import { existsSync, readFileSync } from "fs";
 import { splitVoiceSegments, ttsOgg } from "./voice.js";
 
 // 容器默认 UTC,AI 的「今天」会比北京慢 8 小时。强制中国时间(不要可去掉),claude 子进程继承。
@@ -268,7 +269,16 @@ function extractImages(messages) {
 
 const app = express();
 app.use(express.json({ limit: "100mb" }));
-app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length }));
+// persona/mcp:重部署丢私有文件的事故一眼可见——persona=false 或 mcp!=="ok" 就是出事了
+function setupStatus() {
+  let mcp = "missing";
+  try {
+    const t = readFileSync(MCP_CONFIG, "utf8");
+    mcp = t.includes("<你的") ? "placeholder" : "ok";
+  } catch {}
+  return { persona: existsSync("CLAUDE.md"), mcp };
+}
+app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length, ...setupStatus() }));
 app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
   voice: { ready: voiceReady(), model: EL_MODEL_ID, settings: VOICE_SETTINGS },
