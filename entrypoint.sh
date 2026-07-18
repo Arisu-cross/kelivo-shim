@@ -20,11 +20,15 @@ unset ANTHROPIC_API_KEY   # subscription channel must win
 
 # Voice fallback transcoder: only needed if ElevenLabs can't serve Ogg/Opus
 # directly (plan-gated formats) — then mp3 gets transcoded via ffmpeg.
-# Install is best-effort; without it opus-direct still works.
+# NEVER block boot on this: apt runs in the background under a hard timeout, so a
+# slow/unavailable mirror can't stall `node server.js` and take the whole shim
+# (persona + MCP connections) down. opus-direct works without ffmpeg anyway; the
+# mp3 fallback just starts working once this finishes.
 if [ -n "$ELEVENLABS_API_KEY" ] && ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "[entrypoint] installing ffmpeg (voice mp3 fallback)..."
-  (apt-get update -qq && apt-get install -y -qq --no-install-recommends ffmpeg) \
-    || echo "[entrypoint] ffmpeg install failed; voice works only if opus-direct is available"
+  echo "[entrypoint] installing ffmpeg in background (voice mp3 fallback)..."
+  ( timeout 120 bash -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends ffmpeg' \
+      && echo "[entrypoint] ffmpeg ready" \
+      || echo "[entrypoint] ffmpeg install skipped/failed; opus-direct still works" ) &
 fi
 
 # Gmail MCP: creds uploaded in gmail-auth/ (non-dot dir survives upload); server
