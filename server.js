@@ -11,6 +11,7 @@
 import express from "express";
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
+import { splitVoiceSegments, ttsOgg } from "./voice.js";
 
 // 容器默认 UTC,AI 的「今天」会比北京慢 8 小时。强制中国时间(不要可去掉),claude 子进程继承。
 process.env.TZ = process.env.TZ || "Asia/Shanghai";
@@ -270,6 +271,7 @@ app.use(express.json({ limit: "100mb" }));
 app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length }));
 app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
+  voice: { ready: voiceReady(), model: EL_MODEL_ID, settings: VOICE_SETTINGS },
   wake: {
     bark: !!BARK_KEY,
     tg: !!TG_TOKEN, tgLocked: !!tgChatId,
@@ -318,7 +320,7 @@ function wakeTurn(idleUserMin) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
       if (!t || t.includes("【沉默】")) { log("[wake] silent"); return; }
       lastSpokeAt = Date.now();
-      if (canTg) tgSendBubbles(t).catch((e) => log("[tg-err]", e.message));
+      if (canTg) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
       else if (BARK_KEY) barkPush(t).catch((e) => log("[bark-err]", e.message));
     },
   };
@@ -393,6 +395,54 @@ async function tgSendBubbles(text) {
     await tgSend(bubbles[i]);
   }
 }
+// 语音:回复里 [语音]English content[/语音] 的段落转 ElevenLabs TTS,
+// 以 Telegram 原生语音条(sendVoice)发出,与文字气泡按出现顺序混排。
+// 未配 key/voice_id、额度耗尽、API 报错、转码失败 → 该段原样降级为文字,内容不丢。
+const EL_KEY = process.env.ELEVENLABS_API_KEY || "";
+const EL_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
+const EL_MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
+const VOICE_SPEED = Math.min(1.2, Math.max(0.7, +(process.env.VOICE_SPEED || 0.85) || 0.85));
+// 音色渲染配方(人耳盲测拍板;默认值是 2026-07 盲测结果):
+// stability 低→语调起伏大更松弛;similarity 高→贴 Voice Design 原始样本的质感;
+// style 高→磁性/玩味,过高会失控。
+const VOICE_SETTINGS = {
+  speed: VOICE_SPEED,
+  stability: Math.min(1, Math.max(0, +(process.env.VOICE_STABILITY ?? 0.45))),
+  similarity_boost: Math.min(1, Math.max(0, +(process.env.VOICE_SIMILARITY ?? 0.95))),
+  style: Math.min(1, Math.max(0, +(process.env.VOICE_STYLE ?? 0.35))),
+  use_speaker_boost: process.env.VOICE_SPEAKER_BOOST !== "0",
+};
+const voiceReady = () => !!(EL_KEY && EL_VOICE_ID);
+
+async function tgSendVoice(ogg) {
+  const fd = new FormData();
+  fd.append("chat_id", String(tgChatId));
+  fd.append("voice", new Blob([ogg], { type: "audio/ogg" }), "voice.ogg");
+  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendVoice`,
+    { method: "POST", body: fd, signal: AbortSignal.timeout(60000) });
+  const j = await r.json();
+  if (!j.ok) throw new Error(`sendVoice: ${JSON.stringify(j).slice(0, 200)}`);
+}
+
+// 一轮回复的统一出口:切语音/文字段,按顺序发。
+async function tgSendReply(text) {
+  if (!tgChatId || !text) return;
+  for (const seg of splitVoiceSegments(text)) {
+    if (!seg.content.trim()) continue;
+    if (seg.type === "voice" && voiceReady()) {
+      try {
+        tgApi("sendChatAction", { chat_id: tgChatId, action: "record_voice" }).catch(() => {});
+        await tgSendVoice(await ttsOgg({
+          text: seg.content, apiKey: EL_KEY, voiceId: EL_VOICE_ID,
+          modelId: EL_MODEL_ID, voiceSettings: VOICE_SETTINGS, log,
+        }));
+        continue;
+      } catch (e) { log("[voice-err]", e.message); } // 落到下面的文字降级
+    }
+    await tgSendBubbles(seg.content);
+  }
+}
+
 async function tgFetchPhoto(m) {
   // 取最大尺寸的那张;下载转 base64 image block
   try {
@@ -423,7 +473,7 @@ async function handleTgMessage(m) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
       (async () => {
         if (think.trim()) await tgSendThinking(think.trim());
-        await tgSendBubbles(t || "…");
+        await tgSendReply(t || "…");
       })().catch((e) => log("[tg-err]", e.message));
     },
   };
