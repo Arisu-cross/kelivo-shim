@@ -356,6 +356,16 @@ async function tgApi(method, payload) {
   });
   return r.json();
 }
+const TG_THINKING = process.env.TG_THINKING !== "0"; // 思考链以折叠引用块发出,点开看;0 关闭
+const tgEsc = (x) => x.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+async function tgSendThinking(think) {
+  if (!tgChatId || !think) return;
+  // 可折叠引用块:默认收起一行,点开展开——等价于 Kelivo 的 reasoning 视图
+  const body = think.length > 3600 ? think.slice(0, 3600) + "…" : think;
+  const j = await tgApi("sendMessage", { chat_id: tgChatId, parse_mode: "HTML",
+    text: `<blockquote expandable>${tgEsc(body)}</blockquote>` });
+  if (!j.ok) log("[tg-think-err]", JSON.stringify(j).slice(0, 200));
+}
 async function tgSend(text) {
   if (!tgChatId || !text) return;
   for (let i = 0; i < text.length; i += 4000) {  // TG 单条上限 4096
@@ -385,12 +395,16 @@ async function handleTgMessage(m) {
   // 生成回复期间维持「正在输入…」
   const typing = setInterval(() => tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {}), 4500);
   tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {});
+  let think = "";
   const sink = {
-    text() {}, thinking() {},
+    text() {}, thinking(t) { if (TG_THINKING) think += t; },
     finish(_u, fullText) {
       clearInterval(typing);
       const t = (fullText || "").replace(/‖/g, "\n").trim();
-      tgSend(t || "…").catch((e) => log("[tg-err]", e.message));
+      (async () => {
+        if (think.trim()) await tgSendThinking(think.trim());
+        await tgSend(t || "…");
+      })().catch((e) => log("[tg-err]", e.message));
     },
   };
   submitTurn(text, images, sink, { src: "telegram" });
