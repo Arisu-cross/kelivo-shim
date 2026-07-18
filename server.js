@@ -271,7 +271,7 @@ app.use(express.json({ limit: "100mb" }));
 app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length }));
 app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
-  voice: { ready: voiceReady(), model: EL_MODEL_ID, speed: VOICE_SPEED },
+  voice: { ready: voiceReady(), model: EL_MODEL_ID, settings: VOICE_SETTINGS },
   wake: {
     bark: !!BARK_KEY,
     tg: !!TG_TOKEN, tgLocked: !!tgChatId,
@@ -402,6 +402,16 @@ const EL_KEY = process.env.ELEVENLABS_API_KEY || "";
 const EL_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 const EL_MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
 const VOICE_SPEED = Math.min(1.2, Math.max(0.7, +(process.env.VOICE_SPEED || 1) || 1));
+// 音色渲染配方(人耳盲测拍板;默认值是 2026-07 盲测结果):
+// stability 低→语调起伏大更松弛;similarity 高→贴 Voice Design 原始样本的质感;
+// style 高→磁性/玩味,过高会失控。
+const VOICE_SETTINGS = {
+  speed: VOICE_SPEED,
+  stability: Math.min(1, Math.max(0, +(process.env.VOICE_STABILITY ?? 0.45))),
+  similarity_boost: Math.min(1, Math.max(0, +(process.env.VOICE_SIMILARITY ?? 0.95))),
+  style: Math.min(1, Math.max(0, +(process.env.VOICE_STYLE ?? 0.35))),
+  use_speaker_boost: process.env.VOICE_SPEAKER_BOOST !== "0",
+};
 const voiceReady = () => !!(EL_KEY && EL_VOICE_ID);
 
 async function tgSendVoice(ogg) {
@@ -424,7 +434,7 @@ async function tgSendReply(text) {
         tgApi("sendChatAction", { chat_id: tgChatId, action: "record_voice" }).catch(() => {});
         await tgSendVoice(await ttsOgg({
           text: seg.content, apiKey: EL_KEY, voiceId: EL_VOICE_ID,
-          modelId: EL_MODEL_ID, speed: VOICE_SPEED, log,
+          modelId: EL_MODEL_ID, voiceSettings: VOICE_SETTINGS, log,
         }));
         continue;
       } catch (e) { log("[voice-err]", e.message); } // 落到下面的文字降级

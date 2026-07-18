@@ -27,14 +27,16 @@ export function splitVoiceSegments(text) {
 
 // ElevenLabs TTS → Ogg/Opus Buffer(Telegram sendVoice 要求的格式)。
 // 优先请求 opus 直出;拿不到(部分 output_format 有套餐门槛)退 mp3 + ffmpeg 转码。
-export async function ttsOgg({ text, apiKey, voiceId, modelId, speed, log = () => {} }) {
+// voiceSettings 整个对象透传(speed/stability/similarity_boost/style/use_speaker_boost),
+// 配方由人耳盲测定,见机教版环境变量表。
+export async function ttsOgg({ text, apiKey, voiceId, modelId, voiceSettings, log = () => {} }) {
   const call = async (fmt) => {
     const r = await fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=${fmt}`,
       {
         method: "POST",
         headers: { "xi-api-key": apiKey, "Content-Type": "application/json" },
-        body: JSON.stringify({ text, model_id: modelId, voice_settings: { speed } }),
+        body: JSON.stringify({ text, model_id: modelId, voice_settings: voiceSettings }),
         signal: AbortSignal.timeout(60000),
       }
     );
