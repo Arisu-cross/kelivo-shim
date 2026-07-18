@@ -318,7 +318,7 @@ function wakeTurn(idleUserMin) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
       if (!t || t.includes("【沉默】")) { log("[wake] silent"); return; }
       lastSpokeAt = Date.now();
-      if (canTg) tgSend(t).catch((e) => log("[tg-err]", e.message));
+      if (canTg) tgSendBubbles(t).catch((e) => log("[tg-err]", e.message));
       else if (BARK_KEY) barkPush(t).catch((e) => log("[bark-err]", e.message));
     },
   };
@@ -373,6 +373,26 @@ async function tgSend(text) {
     if (!j.ok) log("[tg-send-err]", JSON.stringify(j).slice(0, 200));
   }
 }
+// 分气泡:按换行把一轮回复拆成多条消息,一行一个气泡,像真人连发微信。
+// 气泡边界由 AI 自己的换行决定(人设本就习惯短句分行);上限防刷屏,超出并入最后一条。
+const TG_SPLIT = process.env.TG_SPLIT !== "0";
+const TG_SPLIT_MAX = +(process.env.TG_SPLIT_MAX || 8);
+const tgSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function tgSendBubbles(text) {
+  if (!tgChatId || !text) return;
+  if (!TG_SPLIT) return tgSend(text);
+  const lines = text.split("\n").map((x) => x.trim()).filter(Boolean);
+  if (lines.length <= 1) return tgSend(text);
+  const bubbles = lines.slice(0, TG_SPLIT_MAX);
+  if (lines.length > TG_SPLIT_MAX) bubbles[TG_SPLIT_MAX - 1] = lines.slice(TG_SPLIT_MAX - 1).join("\n");
+  for (let i = 0; i < bubbles.length; i++) {
+    if (i) { // 第二条起:先亮"正在输入",按字数停顿,再发——手感像真人打字
+      tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {});
+      await tgSleep(Math.min(500 + bubbles[i].length * 35, 2500));
+    }
+    await tgSend(bubbles[i]);
+  }
+}
 async function tgFetchPhoto(m) {
   // 取最大尺寸的那张;下载转 base64 image block
   try {
@@ -403,7 +423,7 @@ async function handleTgMessage(m) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
       (async () => {
         if (think.trim()) await tgSendThinking(think.trim());
-        await tgSend(t || "…");
+        await tgSendBubbles(t || "…");
       })().catch((e) => log("[tg-err]", e.message));
     },
   };
