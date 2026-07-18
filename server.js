@@ -401,7 +401,7 @@ async function tgSendBubbles(text) {
 const EL_KEY = process.env.ELEVENLABS_API_KEY || "";
 const EL_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 const EL_MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
-const VOICE_SPEED = Math.min(1.2, Math.max(0.7, +(process.env.VOICE_SPEED || 1) || 1));
+const VOICE_SPEED = Math.min(1.2, Math.max(0.7, +(process.env.VOICE_SPEED || 0.85) || 0.85));
 // 音色渲染配方(人耳盲测拍板;默认值是 2026-07 盲测结果):
 // stability 低→语调起伏大更松弛;similarity 高→贴 Voice Design 原始样本的质感;
 // style 高→磁性/玩味,过高会失控。
