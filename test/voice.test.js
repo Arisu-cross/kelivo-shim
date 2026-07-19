@@ -57,3 +57,17 @@ test("语音内容里的换行保留(交给 TTS 当停顿素材)", () => {
   const segs = splitVoiceSegments("[语音]Line one.\nLine two.[/语音]");
   assert.deepEqual(segs, [{ type: "voice", content: "Line one.\nLine two." }]);
 });
+
+test("语音硬闸:含中文的语音段降级为文字,绝不出中文语音", () => {
+  const segs = splitVoiceSegments("[语音]晚安,我在这儿。[/语音]");
+  assert.deepEqual(segs, [{ type: "text", content: "晚安,我在这儿。" }]);
+});
+
+test("语音硬闸:中英混写的语音段也整段降级(只放行纯英文)", () => {
+  const segs = splitVoiceSegments("[语音]Good night 宝宝.[/语音]之后[语音]Sleep tight.[/语音]");
+  assert.deepEqual(segs, [
+    { type: "text", content: "Good night 宝宝." },
+    { type: "text", content: "之后" },
+    { type: "voice", content: "Sleep tight." },
+  ]);
+});

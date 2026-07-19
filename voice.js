@@ -9,8 +9,14 @@ import { spawn } from "child_process";
 // 未闭合的开标记匹配不上 → 原样当普通文本,不吞字。
 const VOICE_RE = /[\[【]\s*语音\s*[\]】]([\s\S]*?)[\[【]\s*[/／]\s*语音\s*[\]】]/g;
 
+// 语音硬闸:只出英文。命中中日韩汉字/假名/全角形 → 这段绝不送 TTS。
+// 汉字(基本+扩展A)、兼容汉字、平/片假名、全角与半角假名标点全覆盖。
+// 声音说中文/日文太出戏,宁可降级成文字也不出非英文语音。
+const NON_LATIN_RE = /[぀-ヿ㐀-䶿一-鿿豈-﫿＀-￯]/;
+
 // 把一轮回复切成 [{ type: "text"|"voice", content }] 有序段落。
 // 空白的语音段丢弃;文字段原样保留(交给发送方自己 trim/分行)。
+// 含非拉丁字符的语音段降级为文字(见 NON_LATIN_RE),不出中文语音。
 export function splitVoiceSegments(text) {
   const segs = [];
   let last = 0;
@@ -18,7 +24,7 @@ export function splitVoiceSegments(text) {
   for (let m; (m = VOICE_RE.exec(text)); ) {
     if (m.index > last) segs.push({ type: "text", content: text.slice(last, m.index) });
     const inner = m[1].trim();
-    if (inner) segs.push({ type: "voice", content: inner });
+    if (inner) segs.push({ type: NON_LATIN_RE.test(inner) ? "text" : "voice", content: inner });
     last = m.index + m[0].length;
   }
   if (last < text.length) segs.push({ type: "text", content: text.slice(last) });
