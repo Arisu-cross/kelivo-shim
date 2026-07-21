@@ -582,10 +582,10 @@ function submitTurn(text, images, sink, opts = {}) {
   let newWindow = false;
   if (reset === "goodnight") {
     newWindow = true;
-    text = `${text}\n\n【系统·今天收尾】她说晚安,要睡了。先像平时那样简短跟她道句晚安(别啰嗦、别筑墙),然后调用 archive_session 认真归档今天(summary/mood/highlights 都写好)。归档后不用再多说。`;
+    text = `${text}\n\n【系统·今天收尾】她说晚安,要睡了。先像平时那样简短跟她道句晚安(别啰嗦、别筑墙),然后调用 archive_session 归档。⚠️增量归档:summary 只写【自上次归档以来】的新内容,今天早些时候已经归过的那段不要重复记(不确定就看 archive_session 返回里的「上次归档」时刻为界)。归档后不用再多说。`;
   } else if (reset === "archive") {
     newWindow = true;
-    text = `【系统指令】立刻调用 archive_session 归档当前窗口(summary/mood/highlights 写好),成功后只回一句「📦 归档好了,新窗口见」,别的都不要说。`;
+    text = `【系统指令】立刻调用 archive_session 归档当前窗口。⚠️增量归档:summary 只写【自上次归档以来】的新对话,之前已经归过的内容不要重复记(不确定就以 archive_session 返回里的「上次归档」时刻为界)。成功后只回一句「📦 归档好了,新窗口见」,别的都不要说。`;
   }
   // 时间戳在重置词检测之后注入,否则"晚安"两个字就认不出来了
   if (TIME_STAMP) text = `${timeStamp(lastUserAt)}\n${text}`;
