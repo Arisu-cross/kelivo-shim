@@ -34,7 +34,13 @@ if [ -d gmail-auth ]; then
   cp gmail-auth/* "${HOME:-/root}/.gmail-mcp/" || true
 fi
 
-# MCP config (regenerated each boot; dotfiles may not survive upload)
+# MCP config:优先从 /persona 保险箱恢复真实配置(2026-07-22 事故:换容器后 /src 丢失
+# 手工放的真实 .mcp.json,下面的占位符兜底顶上 → 沈渡所有 MCP 工具断连。真实配置含
+# 私人域名/token 引用,不能进公开仓库,所以正本存 /persona 卷,这里开机恢复。)
+if [ ! -f .mcp.json ] && [ -f /persona/.mcp.json ]; then
+  cp /persona/.mcp.json .mcp.json && echo "[entrypoint] restored .mcp.json from /persona"
+fi
+# 最后兜底:占位符模板(只应在全新环境出现;线上见到它=保险箱丢了,去 /persona 查)
 if [ ! -f .mcp.json ]; then
   cat > .mcp.json <<'JSON'
 { "mcpServers": {
