@@ -124,6 +124,7 @@ const OB_TRACE = process.env.OB_TRACE !== "0";
 const OB_TRACE_ARG_MAX = +(process.env.OB_TRACE_ARG_MAX || 300);
 const OB_TRACE_RES_MAX = +(process.env.OB_TRACE_RES_MAX || 400);
 const obToolNames = new Map(); // tool_use_id -> 短名(跨事件对齐返回)
+const archiveCallIds = new Set(); // 本轮 archive_session 调用的 tool_use_id(安全阀:确认真归档才换窗)
 const trunc = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
 
 function handleEvent(ev) {
@@ -134,6 +135,8 @@ function handleEvent(ev) {
       const cb = e.content_block || {};
       if (cb.type === "tool_use" && typeof cb.name === "string" && cb.name.startsWith("mcp__ombre__")) {
         const short = cb.name.replace("mcp__ombre__", "");
+        // 安全阀:记下 archive_session 的调用 id,等它的返回确认成功(与 OB_TRACE 无关)
+        if (short === "archive_session" && cb.id) archiveCallIds.add(cb.id);
         const label = OB_LABELS[short] || short;
         turn.sse?.thinking(`\n〔${label}〕\n`);
         if (OB_TRACE) {
@@ -155,6 +158,18 @@ function handleEvent(ev) {
       if (args && args !== "{}") turn.sse?.thinking(`→ ${b.name} ${trunc(args, OB_TRACE_ARG_MAX)}\n`);
     }
     return;
+  }
+  // 安全阀:归档成功检测(archive_session 成功返回带 🗄️;失败为"归档失败/summary 不能为空",无 🗄️)。与 OB_TRACE 无关。
+  if (ev.type === "user" && archiveCallIds.size) {
+    const cont = ev.message?.content;
+    if (Array.isArray(cont)) for (const b of cont) {
+      if (b.type === "tool_result" && archiveCallIds.has(b.tool_use_id)) {
+        archiveCallIds.delete(b.tool_use_id);
+        const txt = typeof b.content === "string" ? b.content
+          : Array.isArray(b.content) ? b.content.map((x) => x.text || "").join(" ") : "";
+        if (txt.includes("🗄️") && turn) turn.archiveOk = true;
+      }
+    }
   }
   // OB 工具返回(tool_result 以 user 事件回流):截取摘要进思考链
   if (OB_TRACE && ev.type === "user") {
@@ -179,13 +194,20 @@ function handleEvent(ev) {
       log("[result-error]", ev.subtype);
       if (!turn.fullText) turn.sse?.text(`⚠️[shim] ${ev.subtype}`);
     }
+    const wantSwitch = turn.newWindow;
+    const archivedOk = turn.archiveOk;
+    // 安全阀:想换窗但没成功归档 → 不换窗、保住窗口、提示她(宁可不换,绝不丢记忆)
+    if (wantSwitch && !archivedOk) {
+      turn.sse?.text("\n\n⚠️〔窗口保住了〕这次没成功归档,为防丢记忆没有换窗。想换新窗口,请先确认归档成功。");
+      log("[window] switch requested but no successful archive — keeping window");
+    }
     const usage = ev.usage ? { output_tokens: ev.usage.output_tokens } : undefined;
-    const wasNewWindow = turn.newWindow;
+    const doKill = wantSwitch && archivedOk && proc;
     turn.done = true;
     turn.sse?.finish(usage, turn.fullText);
     turn = null;
     busy = false;
-    if (wasNewWindow && proc) { log("[window] archived, restarting proc"); try { proc.kill(); } catch {} proc = null; }
+    if (doKill) { log("[window] archived ok, restarting proc"); try { proc.kill(); } catch {} proc = null; }
     pump();
   }
 }
@@ -202,7 +224,7 @@ function pump() {
   if (proc && (item.system !== spawnedSystem || wantModel !== spawnedModel)) { try { proc.kill(); } catch {} proc = null; }
   ensureProc(item.system, wantModel);
 
-  turn = { sse: item.sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {} };
+  turn = { sse: item.sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {}, archiveOk: false };
   const content = item.images && item.images.length
     ? [{ type: "text", text: item.text }, ...item.images]
     : item.text;
@@ -565,29 +587,24 @@ function timeStamp(prevUserAt) {
   return s + "】";
 }
 
-// 重置词:归档今天 + 重启窗口。晚安=一天收尾(先道晚安再归档);其余=显式换窗口。
-const GOODNIGHT_WORDS = ["晚安"];
-const ARCHIVE_WORDS = ["归档", "换窗口", "开新窗口", "新窗口", "开新档", "换个窗口", "换新窗口"];
+// 意图识别:只有「换窗口/开新窗口」= 归档+换窗;「归档/晚安」= 只归档、窗口不动;其余不识别。
+// ⚠️不再注入任何"假系统指令"——沈渡按人设里和栖栖的约定,听她的话自己归档。
+const SWITCH_WORDS = ["换窗口", "开新窗口"];  // 归档并重启窗口(仅这两个词)
+const ARCHIVE_WORDS = ["归档", "晚安"];        // 只归档,窗口不动
 function stripEnds(s) { return (s || "").trim().replace(/^[\s，,。.!！~～、]+|[\s，,。.!！~～、]+$/g, ""); }
 function detectReset(text) {
   const t = stripEnds(text);
-  for (const w of GOODNIGHT_WORDS) { if (t === w || (t.length <= 6 && t.startsWith(w))) return "goodnight"; }
-  for (const w of ARCHIVE_WORDS) { if (t === w || (t.length <= 8 && t.includes(w))) return "archive"; }
+  for (const w of SWITCH_WORDS) { if (t === w || (t.length <= 8 && t.includes(w))) return "switch"; }
+  for (const w of ARCHIVE_WORDS) { if (t === w || (t.length <= 6 && t.includes(w))) return "archive"; }
   return null;
 }
 
-// Kelivo 与 Telegram 共用的进队逻辑:重置词 → 时间戳 → enqueue
+// Kelivo 与 Telegram 共用的进队逻辑:意图识别 → 时间戳 → enqueue
 function submitTurn(text, images, sink, opts = {}) {
   const reset = images.length ? null : detectReset(text);
-  let newWindow = false;
-  if (reset === "goodnight") {
-    newWindow = true;
-    text = `${text}\n\n【系统·今天收尾】她说晚安,要睡了。先像平时那样简短跟她道句晚安(别啰嗦、别筑墙),然后调用 archive_session 归档。⚠️增量归档:summary 只写【自上次归档以来】的新内容,今天早些时候已经归过的那段不要重复记(不确定就看 archive_session 返回里的「上次归档」时刻为界)。归档后不用再多说。`;
-  } else if (reset === "archive") {
-    newWindow = true;
-    text = `【系统指令】立刻调用 archive_session 归档当前窗口。⚠️增量归档:summary 只写【自上次归档以来】的新对话,之前已经归过的内容不要重复记(不确定就以 archive_session 返回里的「上次归档」时刻为界)。成功后只回一句「📦 归档好了,新窗口见」,别的都不要说。`;
-  }
-  // 时间戳在重置词检测之后注入,否则"晚安"两个字就认不出来了
+  // 只有 switch 才重启窗口;archive/无 都不重启。归档动作交给沈渡自己按约定完成。
+  const newWindow = reset === "switch";
+  // 时间戳在意图识别之后注入,否则"归档/晚安"这类短词会被时间戳前缀顶掉认不出
   if (TIME_STAMP) text = `${timeStamp(lastUserAt)}\n${text}`;
   lastUserAt = Date.now(); // 自主时间空闲计时基准
   log("[turn]", { src: opts.src || "kelivo", len: text.length, imgs: images.length, reset: reset || "-" });
