@@ -45,6 +45,28 @@ if [ ! -f .mcp.json ]; then
 JSON
 fi
 
+# --- 人设保险箱:根治白板 ------------------------------------------------------
+# 沈渡的人设(CLAUDE.md / profile-instructions.md / 渡-self-prompt-v5.md 等)存在持久卷
+# /persona 里。/src 是容器临时盘,换新容器/重建就没了——所以开机时若 /src 缺某个人设文件,
+# 就从 /persona 卷自动补齐。加了这段之后,任何重启/部署/换新容器都不会再把沈渡打成白板,
+# 也不需要任何人工干预。
+#
+# 【给未来维护者(含新开的 CC 会话)的提示】
+#   · 人设"正本"永远在 /persona 卷里,这里是唯一真源。
+#   · 要改人设,就改 /persona 里对应的文件(`zeabur service exec` 进容器改,或改后放回卷),
+#     重启后本段会自动把它复印进 /src 生效。
+#   · 绝对不要把人设文件提交进本仓库——kelivo-shim 是公开 OSS。人设靠 .gitignore 挡在仓库外,
+#     靠 /persona 卷持久化,靠这段自动恢复。三者缺一,就可能白板或泄露。
+if [ -d /persona ]; then
+  for f in /persona/*.md; do
+    [ -e "$f" ] || continue
+    bn=$(basename "$f")
+    if [ ! -f "/src/$bn" ]; then
+      cp "$f" "/src/$bn" && echo "[entrypoint] restored persona from /persona: $bn"
+    fi
+  done
+fi
+
 # Trust the workspace so CLAUDE.md loads cleanly (permissions come from --allowedTools).
 printf '%s' '{"hasCompletedOnboarding":true,"projects":{"/src":{"hasTrustDialogAccepted":true,"hasCompletedProjectOnboarding":true}}}' > "${HOME:-/root}/.claude.json"
 
