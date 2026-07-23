@@ -27,6 +27,12 @@ if [ -n "$ELEVENLABS_API_KEY" ] && ! command -v ffmpeg >/dev/null 2>&1; then
     || echo "[entrypoint] ffmpeg install failed; voice works only if opus-direct is available"
 fi
 
+# gmail 凭据也进保险箱(2026-07-23 事故:一次部署换容器把 /src/gmail-auth 冲没了,
+# gmail MCP 断连。凭据含 OAuth 令牌不能进公开仓库,所以正本存 /persona 卷、这里开机恢复。
+# ⚠️ 前提:得先把 gmail-auth/ 放进 /persona 卷(目前凭据丢失、待栖栖找回或重建后放入)。
+if [ ! -d gmail-auth ] && [ -d /persona/gmail-auth ]; then
+  cp -r /persona/gmail-auth /src/gmail-auth && echo "[entrypoint] restored gmail-auth from /persona"
+fi
 # Gmail MCP: creds uploaded in gmail-auth/ (non-dot dir survives upload); server
 # reads them from ~/.gmail-mcp/. Pre-install so npx resolves without a cold download.
 if [ -d gmail-auth ]; then
