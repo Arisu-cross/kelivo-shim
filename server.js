@@ -476,13 +476,39 @@ async function tgFetchPhoto(m) {
     return { type: "image", source: { type: "base64", media_type: "image/jpeg", data: buf.toString("base64") } };
   } catch (e) { log("[tg-photo-err]", e.message); return null; }
 }
+async function tgFetchSticker(m) {
+  // 贴纸/表情包:静态贴纸(webp)直接给图;动图(.tgs)/视频(.webm)贴纸没法当静图,
+  // 退而取它的静态缩略图。都带上贴纸自带的 emoji 作情绪线索。Claude 视觉支持 webp。
+  const s = m.sticker || {};
+  const emoji = s.emoji || "";
+  try {
+    let fileId = null;
+    if (!s.is_animated && !s.is_video) fileId = s.file_id;      // 静态贴纸本体
+    else if (s.thumbnail) fileId = s.thumbnail.file_id;         // 动图/视频取缩略图
+    if (!fileId) return { image: null, emoji };
+    const gf = await tgApi("getFile", { file_id: fileId });
+    if (!gf.ok) return { image: null, emoji };
+    const path = gf.result.file_path || "";
+    const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${path}`);
+    const buf = Buffer.from(await r.arrayBuffer());
+    const mt = /\.png$/i.test(path) ? "image/png"
+      : /\.jpe?g$/i.test(path) ? "image/jpeg" : "image/webp";
+    return { image: { type: "image", source: { type: "base64", media_type: mt, data: buf.toString("base64") } }, emoji };
+  } catch (e) { log("[tg-sticker-err]", e.message); return { image: null, emoji }; }
+}
 async function handleTgMessage(m) {
   if (!m.chat || m.chat.type !== "private") return;
   if (!tgChatId) { tgChatId = m.chat.id; log("[tg] chat locked:", tgChatId); }
   else if (m.chat.id !== tgChatId) return; // 单用户:只认锁定的那个人
-  const text = (m.text || m.caption || "").trim();
+  let text = (m.text || m.caption || "").trim();
   const images = [];
   if (m.photo && m.photo.length) { const img = await tgFetchPhoto(m); if (img) images.push(img); }
+  if (m.sticker) {
+    const { image, emoji } = await tgFetchSticker(m);
+    if (image) images.push(image);
+    const note = `(她发来一个贴纸/表情包${emoji ? " " + emoji : ""}${image ? "——就是上面这张图" : ",但图没取到,只有这个表情符号"})`;
+    text = text ? `${text}\n${note}` : note;
+  }
   if (!text && !images.length) return;
   // 生成回复期间维持「正在输入…」
   const typing = setInterval(() => tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {}), 4500);
