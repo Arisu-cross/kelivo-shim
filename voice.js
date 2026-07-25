@@ -9,6 +9,12 @@ import { spawn } from "child_process";
 // 未闭合的开标记匹配不上 → 原样当普通文本,不吞字。
 const VOICE_RE = /[\[【]\s*语音\s*[\]】]([\s\S]*?)[\[【]\s*[/／]\s*语音\s*[\]】]/g;
 
+// 语音段只走英文:这个音色是按英文调的,一套配方没法同时顾好中英文的流畅度,
+// 中文念出来会走音发飘,听着难受。所以语音段里只要出现 CJK 字符(汉字/假名/谚文),
+// 就不送 TTS,原样退回文字气泡——内容一个字都不丢,只是这段不出声。
+// 人设里也有对应约定(语音段用英文写),这里是保底,防止偶尔写漏。
+const CJK_RE = /[㐀-䶿一-鿿぀-ヿ가-힯]/;
+
 // 把一轮回复切成 [{ type: "text"|"voice", content }] 有序段落。
 // 空白的语音段丢弃;文字段原样保留(交给发送方自己 trim/分行)。
 export function splitVoiceSegments(text) {
@@ -18,7 +24,7 @@ export function splitVoiceSegments(text) {
   for (let m; (m = VOICE_RE.exec(text)); ) {
     if (m.index > last) segs.push({ type: "text", content: text.slice(last, m.index) });
     const inner = m[1].trim();
-    if (inner) segs.push({ type: "voice", content: inner });
+    if (inner) segs.push({ type: CJK_RE.test(inner) ? "text" : "voice", content: inner });
     last = m.index + m[0].length;
   }
   if (last < text.length) segs.push({ type: "text", content: text.slice(last) });
