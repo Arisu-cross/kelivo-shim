@@ -9,6 +9,7 @@
 // 单用户单进程:一次一轮,busy 队列串行。
 
 import express from "express";
+import fs from "fs";
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg } from "./voice.js";
@@ -293,7 +294,7 @@ app.use(express.json({ limit: "100mb" }));
 app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length }));
 app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
-  voice: { ready: voiceReady(), model: EL_MODEL_ID, settings: VOICE_SETTINGS },
+  voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg) },
   ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
   wake: {
     bark: !!BARK_KEY,
@@ -367,6 +368,42 @@ app.post("/hb", (req, res) => {
   res.json({ ok: true, triggered: true });
 });
 
+// ---- 音色热更新:换音色/调参数不用重启(= 不换窗口) --------------------------
+// GET  /voice?key=<SHIM_KEY>  看当前配置
+// POST /voice?key=<SHIM_KEY>  {"voiceId":"...","speed":0.9,...} 改哪项传哪项,立即生效
+// POST /voice/reset?key=...   丢弃覆盖,退回环境变量的配置
+const voiceAuth = (req, res) =>
+  !SHIM_KEY || (req.query.key || req.get("x-api-key")) === SHIM_KEY
+    ? true : (res.status(401).json({ ok: false }), false);
+
+app.get("/voice", (req, res) => {
+  if (!voiceAuth(req, res)) return;
+  res.json({ ok: true, ready: voiceReady(), cfg: voiceCfg, overridden: fs.existsSync(VOICE_CFG_FILE) });
+});
+
+app.post("/voice", (req, res) => {
+  if (!voiceAuth(req, res)) return;
+  const next = sanitizeVoiceCfg(req.body || {}, voiceCfg);
+  try {
+    fs.writeFileSync(VOICE_CFG_FILE, JSON.stringify(next, null, 2) + "\n");
+  } catch (e) {
+    // 卷不可写就只在内存生效:这轮能听到效果,但重启会丢——如实告知,别假装成功
+    log("[voice] persist failed:", e.message);
+    voiceCfg = next;
+    return res.json({ ok: true, persisted: false, warning: "写入 /persona 失败,重启后失效", cfg: voiceCfg });
+  }
+  voiceCfg = next;
+  log("[voice] updated:", JSON.stringify(voiceCfg));
+  res.json({ ok: true, persisted: true, cfg: voiceCfg });
+});
+
+app.post("/voice/reset", (req, res) => {
+  if (!voiceAuth(req, res)) return;
+  try { fs.unlinkSync(VOICE_CFG_FILE); } catch { /* 本来就没有 */ }
+  voiceCfg = envVoiceCfg();
+  res.json({ ok: true, cfg: voiceCfg });
+});
+
 // ---- Telegram 前端(与 Kelivo 并行,同一个常驻进程=同一个他) --------------------
 // 收消息走 submitTurn 同一条队列;回复与自主发言直接 sendMessage——
 // Telegram bot 天生可主动开口,这是 Kelivo(纯请求-响应)做不到的。
@@ -422,20 +459,56 @@ async function tgSendBubbles(text) {
 // 以 Telegram 原生语音条(sendVoice)发出,与文字气泡按出现顺序混排。
 // 未配 key/voice_id、额度耗尽、API 报错、转码失败 → 该段原样降级为文字,内容不丢。
 const EL_KEY = process.env.ELEVENLABS_API_KEY || "";
-const EL_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
-const EL_MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
-const VOICE_SPEED = Math.min(1.2, Math.max(0.7, +(process.env.VOICE_SPEED || 0.85) || 0.85));
-// 音色渲染配方(人耳盲测拍板;默认值是 2026-07 盲测结果):
-// stability 低→语调起伏大更松弛;similarity 高→贴 Voice Design 原始样本的质感;
-// style 高→磁性/玩味,过高会失控。
-const VOICE_SETTINGS = {
-  speed: VOICE_SPEED,
-  stability: Math.min(1, Math.max(0, +(process.env.VOICE_STABILITY ?? 0.45))),
-  similarity_boost: Math.min(1, Math.max(0, +(process.env.VOICE_SIMILARITY ?? 0.95))),
-  style: Math.min(1, Math.max(0, +(process.env.VOICE_STYLE ?? 0.35))),
-  use_speaker_boost: process.env.VOICE_SPEAKER_BOOST !== "0",
+
+// 音色与渲染配方:**运行时可改,不必重启**。
+// 为什么要这样:改 Zeabur 环境变量会重启容器 = 换窗口。而挑音色、调语速这种事
+// 天然要反复试听微调,每试一次换一次窗口的代价无法接受。所以配置存在
+// /persona/voice.json(持久卷,换容器不丢),用 POST /voice 热改,即时生效。
+// 优先级:voice.json > 环境变量 > 代码默认。
+// stability 低→语调起伏大更松弛;similarity 高→贴原始样本质感;style 高→磁性/玩味,过高会失控。
+const clamp = (v, lo, hi, dflt) => {
+  const n = +v;
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt;
 };
-const voiceReady = () => !!(EL_KEY && EL_VOICE_ID);
+const VOICE_CFG_FILE = "/persona/voice.json";
+
+function envVoiceCfg() {
+  return {
+    voiceId: process.env.ELEVENLABS_VOICE_ID || "",
+    modelId: process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2",
+    speed: clamp(process.env.VOICE_SPEED, 0.7, 1.2, 0.85),
+    stability: clamp(process.env.VOICE_STABILITY, 0, 1, 0.45),
+    similarity_boost: clamp(process.env.VOICE_SIMILARITY, 0, 1, 0.95),
+    style: clamp(process.env.VOICE_STYLE, 0, 1, 0.35),
+    use_speaker_boost: process.env.VOICE_SPEAKER_BOOST !== "0",
+  };
+}
+
+// 只认白名单字段并逐项夹到合法区间——避免把非法值写进去,下次开机就起不来。
+function sanitizeVoiceCfg(patch, base) {
+  const out = { ...base };
+  if (typeof patch.voiceId === "string" && patch.voiceId.trim()) out.voiceId = patch.voiceId.trim();
+  if (typeof patch.modelId === "string" && patch.modelId.trim()) out.modelId = patch.modelId.trim();
+  if ("speed" in patch) out.speed = clamp(patch.speed, 0.7, 1.2, base.speed);
+  if ("stability" in patch) out.stability = clamp(patch.stability, 0, 1, base.stability);
+  if ("similarity_boost" in patch) out.similarity_boost = clamp(patch.similarity_boost, 0, 1, base.similarity_boost);
+  if ("style" in patch) out.style = clamp(patch.style, 0, 1, base.style);
+  if ("use_speaker_boost" in patch) out.use_speaker_boost = !!patch.use_speaker_boost;
+  return out;
+}
+
+let voiceCfg = envVoiceCfg();
+try {
+  const saved = JSON.parse(fs.readFileSync(VOICE_CFG_FILE, "utf8"));
+  voiceCfg = sanitizeVoiceCfg(saved, voiceCfg);
+  log("[voice] loaded override from", VOICE_CFG_FILE, "voiceId=", voiceCfg.voiceId.slice(0, 6) + "…");
+} catch { /* 没有覆盖文件就用 env,正常情况 */ }
+
+const voiceSettingsOf = (c) => ({
+  speed: c.speed, stability: c.stability, similarity_boost: c.similarity_boost,
+  style: c.style, use_speaker_boost: c.use_speaker_boost,
+});
+const voiceReady = () => !!(EL_KEY && voiceCfg.voiceId);
 
 async function tgSendVoice(ogg) {
   const fd = new FormData();
@@ -456,8 +529,8 @@ async function tgSendReply(text) {
       try {
         tgApi("sendChatAction", { chat_id: tgChatId, action: "record_voice" }).catch(() => {});
         await tgSendVoice(await ttsOgg({
-          text: seg.content, apiKey: EL_KEY, voiceId: EL_VOICE_ID,
-          modelId: EL_MODEL_ID, voiceSettings: VOICE_SETTINGS, log,
+          text: seg.content, apiKey: EL_KEY, voiceId: voiceCfg.voiceId,
+          modelId: voiceCfg.modelId, voiceSettings: voiceSettingsOf(voiceCfg), log,
         }));
         continue;
       } catch (e) { log("[voice-err]", e.message); } // 落到下面的文字降级
