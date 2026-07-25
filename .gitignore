@@ -6,3 +6,8 @@ CLAUDE.md
 SHIM_KEY.txt
 *.log
 你的人设.md
+# 人设正本在持久卷上,任何时候都不该出现在本仓库(公开 OSS)。
+# 下面几条是「万一有人把卷上的文件拷到本地」时的兜底,别删。
+profile-instructions.md
+*-self-prompt*.md
+persona/
