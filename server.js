@@ -294,6 +294,7 @@ app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MO
 app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
   voice: { ready: voiceReady(), model: EL_MODEL_ID, settings: VOICE_SETTINGS },
+  ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
   wake: {
     bark: !!BARK_KEY,
     tg: !!TG_TOKEN, tgLocked: !!tgChatId,
@@ -496,6 +497,49 @@ async function tgFetchSticker(m) {
     return { image: { type: "image", source: { type: "base64", media_type: mt, data: buf.toString("base64") } }, emoji };
   } catch (e) { log("[tg-sticker-err]", e.message); return { image: null, emoji }; }
 }
+// ---- 语音消息:听见「怎么说的」,不只是「说了什么」 ----------------------------
+// 她发来的语音条送去 ears 服务:转写 + 和她自己平时的声音比对(音量/停顿/语速…),
+// 结果贴在这条消息上一起进窗口。ears 没配或挂了都只是少一层信息,消息本身不丢。
+const EARS_URL = (process.env.EARS_URL || "").replace(/\/+$/, "");
+const EARS_TOKEN = process.env.EARS_TOKEN || "";
+const earsReady = () => !!EARS_URL;
+
+async function tgFetchVoice(m) {
+  const v = m.voice || m.audio || {};
+  if (!v.file_id) return null;
+  const gf = await tgApi("getFile", { file_id: v.file_id });
+  if (!gf.ok) return null;
+  const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${gf.result.file_path}`);
+  return Buffer.from(await r.arrayBuffer());
+}
+
+async function earsListen(ogg) {
+  const fd = new FormData();
+  fd.append("file", new Blob([ogg], { type: "audio/ogg" }), "voice.ogg");
+  const r = await fetch(`${EARS_URL}/api/listen`, {
+    method: "POST", body: fd,
+    headers: EARS_TOKEN ? { "X-Token": EARS_TOKEN } : {},   // ears 只认 X-Token,别改成 Bearer
+    signal: AbortSignal.timeout(45000),                      // 转写+判断走两趟云端,给足时间
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+
+// 把 ears 的结构化结果写成模型读得懂的一行。刻意不写成「系统指令」——
+// 这是转述她的语音,不是命令模型做什么(2026-07-22 injection 事故的教训)。
+function voiceLine(j) {
+  const said = (j.text || "").trim();
+  const rel = j.relative && Object.keys(j.relative).length
+    ? Object.entries(j.relative).map(([k, v]) => k + v).join("、") : "";
+  const bits = [j.emotion, j.hint, rel && `和她平时比:${rel}`].filter(Boolean);
+  const tone = bits.length ? `(语气:${bits.join(",")})` : "";
+  const learning = /^[0-7]\//.test(j.baseline_progress || "") ? "(还在熟悉她的声音)" : "";
+  return said
+    ? `[语音] ${said}${tone}${learning}`
+    : `(她发来一条语音,但没听清内容${tone})`;
+}
+
 async function handleTgMessage(m) {
   if (!m.chat || m.chat.type !== "private") return;
   if (!tgChatId) { tgChatId = m.chat.id; log("[tg] chat locked:", tgChatId); }
@@ -507,6 +551,23 @@ async function handleTgMessage(m) {
     const { image, emoji } = await tgFetchSticker(m);
     if (image) images.push(image);
     const note = `(她发来一个贴纸/表情包${emoji ? " " + emoji : ""}${image ? "——就是上面这张图" : ",但图没取到,只有这个表情符号"})`;
+    text = text ? `${text}\n${note}` : note;
+  }
+  if (m.voice || m.audio) {
+    // 转写要几秒,先让她看到「正在听」而不是干等
+    tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {});
+    let note;
+    if (!earsReady()) note = "(她发来一条语音——耳朵还没接上,我听不到内容)";
+    else {
+      try {
+        const ogg = await tgFetchVoice(m);
+        note = ogg ? voiceLine(await earsListen(ogg))
+                   : "(她发来一条语音,但没能取到音频)";
+      } catch (e) {
+        log("[ears-err]", e.message);
+        note = "(她发来一条语音,但这次没听清)";   // 降级:宁可少信息,不丢消息
+      }
+    }
     text = text ? `${text}\n${note}` : note;
   }
   if (!text && !images.length) return;

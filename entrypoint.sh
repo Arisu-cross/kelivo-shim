@@ -46,6 +46,20 @@ fi
 if [ ! -f .mcp.json ] && [ -f /persona/.mcp.json ]; then
   cp /persona/.mcp.json .mcp.json && echo "[entrypoint] restored .mcp.json from /persona"
 fi
+# 一次性清理(2026-07-25):mochi 服务已删除,把配置里的 mochi 条目摘掉,顺手把
+# /persona 正本也治好(用 node 解析 JSON 改,不用 sed 抠文本)。条目不在就什么都不做,
+# 将来 /persona 已是干净版时这段等于空转,可在下次整理 entrypoint 时移除。
+for mf in .mcp.json /persona/.mcp.json; do
+  [ -f "$mf" ] || continue
+  node -e '
+    const fs = require("fs"), p = process.argv[1];
+    const j = JSON.parse(fs.readFileSync(p, "utf8"));
+    if (j.mcpServers && j.mcpServers.mochi) {
+      delete j.mcpServers.mochi;
+      fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+      console.log("[entrypoint] removed retired mochi entry from " + p);
+    }' "$mf" || true
+done
 # 最后兜底:占位符模板(只应在全新环境出现;线上见到它=保险箱丢了,去 /persona 查)
 if [ ! -f .mcp.json ]; then
   cat > .mcp.json <<'JSON'
