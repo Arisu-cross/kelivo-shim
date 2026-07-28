@@ -10,9 +10,11 @@
 
 import express from "express";
 import fs from "fs";
+import path from "path";
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg } from "./voice.js";
+import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
 
 // 容器默认 UTC,AI 的「今天」会比北京慢 8 小时。强制中国时间(不要可去掉),claude 子进程继承。
 process.env.TZ = process.env.TZ || "Asia/Shanghai";
@@ -296,6 +298,7 @@ app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
   voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg) },
   ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
+  stickers: { count: stickerNames().length },         // 表情包图库有几张
   wake: {
     bark: !!BARK_KEY,
     tg: !!TG_TOKEN, tgLocked: !!tgChatId,
@@ -520,11 +523,59 @@ async function tgSendVoice(ogg) {
   if (!j.ok) throw new Error(`sendVoice: ${JSON.stringify(j).slice(0, 200)}`);
 }
 
-// 一轮回复的统一出口:切语音/文字段,按顺序发。
+// ---- 表情包:回复里的 [贴纸:名字] 发成原生贴纸 --------------------------------
+// 图库是私人内容,不进这个仓库:注册表与图都在持久卷上,没配就整个功能静默关闭
+// (标记会原样显示成文字,聊天不受影响)。
+// 用 sendSticker 不用 sendPhoto:sendPhoto 会被当"照片"整宽显示,占半个屏幕;
+// sendSticker 才是聊天里小小一块的正经贴纸尺寸。
+const STICKER_FILE = process.env.STICKER_REGISTRY || "/persona/stickers.json";
+const STICKER_DIR = process.env.STICKER_DIR || "/persona/stickers";
+let stickers = loadStickers(STICKER_FILE, log);
+const stickerNames = () => Object.keys(stickers);
+const hasSticker = (n) => !!stickers[n];
+
+// 有 file_id 就直接发(秒发);没有就从卷上传一次 webp,把返回的 file_id 回写注册表——
+// 之后重启/重部署都不必重传。上传失败不抛给聊天,只是这张没发出去。
+async function tgSendSticker(name) {
+  const e = stickers[name];
+  if (!e) return false;
+  if (e.file_id) {
+    const j = await tgApi("sendSticker", { chat_id: tgChatId, sticker: e.file_id });
+    if (j.ok) return true;
+    log("[sticker-err]", name, JSON.stringify(j).slice(0, 160));
+    if (!e.file) return false;
+    delete e.file_id;                        // file_id 失效(换了 bot 等):退回重传一次
+  }
+  if (!e.file) return false;
+  const p = path.join(STICKER_DIR, e.file);
+  const fd = new FormData();
+  fd.append("chat_id", String(tgChatId));
+  fd.append("sticker", new Blob([fs.readFileSync(p)], { type: "image/webp" }), e.file);
+  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendSticker`,
+    { method: "POST", body: fd, signal: AbortSignal.timeout(60000) });
+  const j = await r.json();
+  if (!j.ok) throw new Error(`sendSticker: ${JSON.stringify(j).slice(0, 200)}`);
+  const fid = j.result?.sticker?.file_id;
+  if (fid) { e.file_id = fid; saveStickers(STICKER_FILE, stickers, log); }
+  return true;
+}
+
+// 一轮回复的统一出口:切语音/贴纸/文字段,按出现顺序发。
+// 贴纸只在文字段里找——语音段的内容整段送 TTS,不该被解析。
 async function tgSendReply(text) {
   if (!tgChatId || !text) return;
-  for (const seg of splitVoiceSegments(text)) {
+  const segs = [];
+  for (const s of splitVoiceSegments(text)) {
+    if (s.type === "text") segs.push(...splitStickerSegments(s.content, hasSticker));
+    else segs.push(s);
+  }
+  for (const seg of segs) {
     if (!seg.content.trim()) continue;
+    if (seg.type === "sticker") {
+      try { if (await tgSendSticker(seg.content)) continue; }
+      catch (e) { log("[sticker-err]", seg.content, e.message); }
+      continue;                              // 发不出去就当没这张,不把标记吐给她看
+    }
     if (seg.type === "voice" && voiceReady()) {
       try {
         tgApi("sendChatAction", { chat_id: tgChatId, action: "record_voice" }).catch(() => {});
@@ -613,11 +664,66 @@ function voiceLine(j) {
     : `(她发来一条语音,但没听清内容${tone})`;
 }
 
+// ---- 收集模式:转发一个贴纸给 bot,下一句说「入库:名字」就记下来 ----------------
+// Telegram 贴纸包里的贴纸导不出文件,但它的 file_id 可以直接复用——所以这条路
+// 一张图都不用存,记个号就行,立即可用,不必重启也不必重部署。
+// 「入库」这类管理动作**不进他的窗口**:她整理图库时他不该看见一堆莫名其妙的对话。
+let pendingSticker = null;   // { file_id, emoji, at }
+const INTAKE_RE = /^(?:入库|收录|存)\s*[:：]?\s*(.{1,32})$/;
+
+async function stickerIntake(m, text) {
+  if (m.sticker?.file_id && !m.sticker.is_animated && !m.sticker.is_video) {
+    pendingSticker = { file_id: m.sticker.file_id, emoji: m.sticker.emoji || "", at: Date.now() };
+  }
+  if (!text) return false;
+  if (/^贴纸清单$/.test(text)) {
+    const n = stickerNames();
+    await tgSend(n.length ? `图库里现在有 ${n.length} 张:\n${n.join("、")}` : "图库还是空的。");
+    return true;
+  }
+  const del = /^(?:删除贴纸|删贴纸)\s*[:：]?\s*(.{1,32})$/.exec(text);
+  if (del) {
+    const name = del[1].trim();
+    if (!stickers[name]) { await tgSend(`图库里没有「${name}」。`); return true; }
+    delete stickers[name];
+    saveStickers(STICKER_FILE, stickers, log);
+    await tgSend(`已删掉「${name}」。`);
+    return true;
+  }
+  const mm = INTAKE_RE.exec(text);
+  if (!mm) return false;
+  const name = mm[1].trim();
+  if (!pendingSticker || Date.now() - pendingSticker.at > 10 * 60e3) {
+    await tgSend("要先发一个贴纸过来,再说「入库:名字」。");
+    return true;
+  }
+  stickers[name] = { file_id: pendingSticker.file_id, emoji: pendingSticker.emoji,
+    added: new Date().toISOString().slice(0, 10) };
+  const ok = saveStickers(STICKER_FILE, stickers, log);
+  pendingSticker = null;
+  await tgSend(ok ? `✅ 已入库:「${name}」(共 ${stickerNames().length} 张)`
+                  : `⚠️ 「${name}」记下了,但没写进文件,重启会丢`);
+  return true;
+}
+
+// GET /stickers?key=<SHIM_KEY> —— 看图库里有哪些名字(排查用;注册表本身在卷上)
+app.get("/stickers", (req, res) => {
+  if (!voiceAuth(req, res)) return;
+  res.json({ ok: true, count: stickerNames().length, names: stickerNames(), file: STICKER_FILE });
+});
+// POST /stickers/reload?key=... —— 手工改过卷上的注册表后热加载,不必重启
+app.post("/stickers/reload", (req, res) => {
+  if (!voiceAuth(req, res)) return;
+  stickers = loadStickers(STICKER_FILE, log);
+  res.json({ ok: true, count: stickerNames().length, names: stickerNames() });
+});
+
 async function handleTgMessage(m) {
   if (!m.chat || m.chat.type !== "private") return;
   if (!tgChatId) { tgChatId = m.chat.id; log("[tg] chat locked:", tgChatId); }
   else if (m.chat.id !== tgChatId) return; // 单用户:只认锁定的那个人
   let text = (m.text || m.caption || "").trim();
+  if (await stickerIntake(m, text)) return;   // 收集模式:给刚发的贴纸起个名,不进他的窗口
   const images = [];
   if (m.photo && m.photo.length) { const img = await tgFetchPhoto(m); if (img) images.push(img); }
   if (m.sticker) {
