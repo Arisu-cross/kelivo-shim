@@ -15,7 +15,7 @@ import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
-import { estimateWindowTokens, windowPct, DEFAULT_WINDOW_LIMIT } from "./window.js";
+import { prefixFromMessageStart, windowPct, DEFAULT_WINDOW_LIMIT } from "./window.js";
 
 // 容器默认 UTC,AI 的「今天」会比北京慢 8 小时。强制中国时间(不要可去掉),claude 子进程继承。
 process.env.TZ = process.env.TZ || "Asia/Shanghai";
@@ -76,7 +76,7 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 const COMPACT_HOOK = process.env.COMPACT_HOOK !== "0";
 const WINDOW_LIMIT = +(process.env.WINDOW_LIMIT || DEFAULT_WINDOW_LIMIT);
 const WINDOW_WARN_PCT = +(process.env.WINDOW_WARN_PCT || 85);
-let windowTokens = 0;        // 当前窗口前缀估算(取历次最大值,单调不减;换窗/压缩后归零)
+let windowTokens = 0;        // 当前窗口真实前缀(取自 message_start,非累加值;换窗/压缩后归零)
 let windowWarned = false;    // 本窗口是否已提醒过(一个窗口只吵一次)
 let compactions = 0;         // 本进程发生过几次自动压缩
 let lastCompactAt = null;    // 上次压缩时刻
@@ -194,6 +194,12 @@ function handleEvent(ev) {
   if (!turn) return;
   if (ev.type === "stream_event") {
     const e = ev.event || {}, d = e.delta || {};
+    // 窗口大小的唯一可信来源:每次 API 请求自己的 message_start(不含累加)。
+    // 一轮里工具调用越多、请求次数越多,取本轮最大的那次 = 当轮结束时的真实前缀。
+    if (e.type === "message_start") {
+      const p = prefixFromMessageStart(e);
+      if (p > turn.peakPrefix) turn.peakPrefix = p;
+    }
     if (e.type === "content_block_start") {
       const cb = e.content_block || {};
       if (cb.type === "tool_use" && typeof cb.name === "string" && cb.name.startsWith("mcp__ombre__")) {
@@ -253,9 +259,10 @@ function handleEvent(ev) {
   if (ev.type === "result") {
     lastUsage = ev.usage || null; // 供 /debug 查缓存字段
     lastTurnAt = Date.now(); // 任何一轮完成都刷新了缓存 TTL,自主唤醒以此计时
-    // 窗口用量:取历次最大值(窗口只增不减,单次估算偏低下一轮会自己补上)
-    windowTokens = Math.max(windowTokens, estimateWindowTokens(lastUsage));
-    checkWindowUsage();
+    // 窗口用量:用本轮各次请求里最大的那个真实前缀。
+    // 不跨轮取 max —— 数值本身已经准确,跨轮钉死只会让某次异常永远修不回来
+    // (上一版正是因为 Math.max + 顶层累加值,一次虚报就把 32% 永久显示成 97%)。
+    if (turn.peakPrefix > 0) { windowTokens = turn.peakPrefix; checkWindowUsage(); }
     if (ev.subtype && ev.subtype !== "success") {
       log("[result-error]", ev.subtype);
       if (!turn.fullText) turn.sse?.text(`⚠️[shim] ${ev.subtype}`);
@@ -290,7 +297,7 @@ function pump() {
   if (proc && (item.system !== spawnedSystem || wantModel !== spawnedModel)) { try { proc.kill(); } catch {} proc = null; }
   ensureProc(item.system, wantModel);
 
-  turn = { sse: item.sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {}, archiveOk: false };
+  turn = { sse: item.sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {}, archiveOk: false, peakPrefix: 0 };
   const content = item.images && item.images.length
     ? [{ type: "text", text: item.text }, ...item.images]
     : item.text;

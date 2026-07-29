@@ -10,26 +10,30 @@
 // 换模型/上限变了就用环境变量 WINDOW_LIMIT 覆盖。
 export const DEFAULT_WINDOW_LIMIT = 167000;
 
-const prefixOf = (u) =>
+// 一次 API 请求的「前缀大小」= 这次请求实际送进去的上下文。
+export const prefixOf = (u) =>
   (u?.input_tokens || 0) + (u?.cache_read_input_tokens || 0) + (u?.cache_creation_input_tokens || 0);
 
-// 从一轮的 usage 估算「当前窗口前缀有多大」。
+// ⚠️⚠️ 绝对不要用 result 事件里那个顶层 usage 来估算窗口大小 ⚠️⚠️
 //
-// ⚠️ 不能直接用顶层字段:一轮里每次工具调用都是一次 API 请求,顶层 usage 是这一轮
-// 所有请求的**累加值**。实测一轮 3 次调用、顶层 cache_read 20 万,而真实前缀只有 6.7 万
-// —— 直接拿顶层当窗口大小会高估好几倍,提醒会疯狂误报。
+// 2026-07-29 线上翻车实录:一轮里每调用一次工具就是一次独立的 API 请求,而 CLI 的
+// 顶层 usage 是**整轮所有请求的累加**(源码 v2.1.220:每个 message_stop 都执行
+// `totalUsage = AV6(totalUsage, M1)`,AV6 把 cache_read 等字段逐项相加)。
+// 于是一轮调 3 次工具 → 顶层 cache_read ≈ 真实前缀 × 3。
+// 实测:真实窗口 53947,顶层报 161206,**虚报 3 倍**,把 32% 显示成了 97%,
+// 并触发了一条毫无根据的 85% 提醒。
 //
-// iterations[] 里是每次调用各自的前缀,取最大的那次(窗口在一轮内只增不减,
-// 所以最大的那次最接近当轮结束时的真实大小)。iterations 缺失时(单次调用的轮次,
-// 也就是绝大多数日常对话)顶层就是精确值,直接用。
-export function estimateWindowTokens(usage) {
-  if (!usage) return 0;
-  const iters = Array.isArray(usage.iterations) ? usage.iterations : [];
-  if (!iters.length) return prefixOf(usage);
-  const perCall = Math.max(...iters.map(prefixOf));
-  // 兜底:iterations 里若不含最后一次调用,会略微低估;但窗口大小在 server.js 里
-  // 取历次最大值(单调不减),下一轮就会自动补上,不会一直偏低。
-  return perCall || prefixOf(usage);
+// 更早的版本还想靠 `iterations[]` 兜底(取其中最大的一次)——同样不可靠:
+// 源码里 iterations 是 `q.iterations ?? A.iterations` 直接传递、不累加,
+// 线上绝大多数轮次它就是**空数组**,于是兜底逻辑退回顶层 = 踩进同一个坑。
+//
+// 正确来源只有一个:**每次 API 请求自己的 `message_start` 事件**,
+// 它带的 usage 就是这一次请求的真实前缀,不含任何累加。见 server.js 的 trackMessageStart。
+
+// 从一次 message_start 事件里取出这次请求的前缀大小;不是 message_start 就返回 0。
+export function prefixFromMessageStart(event) {
+  if (!event || event.type !== "message_start") return 0;
+  return prefixOf(event.message?.usage);
 }
 
 export const windowPct = (tokens, limit = DEFAULT_WINDOW_LIMIT) =>

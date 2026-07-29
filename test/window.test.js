@@ -1,50 +1,54 @@
-// 窗口用量估算测试
+// 窗口用量测试
 //
-// 这里最容易搞错、也最值得测的一点:一轮里每次工具调用都是一次 API 请求,
-// usage 顶层是这一轮所有请求的累加值。拿顶层当窗口大小会高估好几倍 ——
-// 下面第二个用例就是线上 /debug 抓下来的真实数据(顶层 cache_read 20 万,
-// 真实前缀 6.7 万),用来钉死这个坑。
+// 这个文件存在的理由是一次真实的线上翻车(2026-07-29):
+// 上一版拿 result 事件的**顶层 usage** 估算窗口大小,而顶层是一轮里所有 API 请求的
+// **累加值**。一轮调 3 次工具 → 虚报 3 倍:真实窗口 53947 被显示成 161206,
+// 32% 显示成 97%,还触发了一条毫无根据的 85% 提醒。
+// 下面的数字全部取自那次事故的线上真实数据。
 
 import { test } from "node:test";
 import assert from "node:assert";
-import { estimateWindowTokens, windowPct, DEFAULT_WINDOW_LIMIT } from "../window.js";
+import { prefixFromMessageStart, prefixOf, windowPct, DEFAULT_WINDOW_LIMIT } from "../window.js";
 
-test("单次调用的轮次:顶层就是精确值", () => {
-  const usage = { input_tokens: 5, cache_read_input_tokens: 67098, cache_creation_input_tokens: 103 };
-  assert.equal(estimateWindowTokens(usage), 67206);
+const msgStart = (u) => ({ type: "message_start", message: { usage: u } });
+
+test("message_start 给出这一次请求的真实前缀", () => {
+  const e = msgStart({ input_tokens: 5, cache_read_input_tokens: 53725, cache_creation_input_tokens: 217 });
+  assert.equal(prefixFromMessageStart(e), 53947);
 });
 
-test("多次调用的轮次:取 iterations 里最大的那次,不能用顶层累加值", () => {
-  // 线上真实数据:顶层 cache_read=200405 是 3 次调用的累加,真实前缀约 6.7 万
-  const usage = {
-    input_tokens: 5,
-    cache_creation_input_tokens: 733,
-    cache_read_input_tokens: 200405,
-    iterations: [
-      { input_tokens: 1, cache_read_input_tokens: 67098, cache_creation_input_tokens: 103 },
-      { input_tokens: 2, cache_read_input_tokens: 67320, cache_creation_input_tokens: 210 },
-    ],
-  };
-  const est = estimateWindowTokens(usage);
-  assert.equal(est, 67532, "应取 iterations 里最大的一次");
-  assert.ok(est < 100000, "绝不能把顶层累加值当窗口大小(会高估 3 倍触发误报)");
+test("【回归】一轮 3 次请求:窗口 = 单次前缀,不是三次之和", () => {
+  // 线上真实:连续三次请求各约 53.7k,而 result 顶层报 161206
+  const calls = [53725, 53725, 53947].map((r) => msgStart({ input_tokens: 0, cache_read_input_tokens: r }));
+  const peak = Math.max(...calls.map(prefixFromMessageStart));
+  assert.equal(peak, 53947, "应是本轮最大的单次前缀");
+  assert.ok(peak < 60000, "绝不能是 161206 那个累加值");
+  assert.equal(windowPct(peak, DEFAULT_WINDOW_LIMIT), 32, "真实占用是 32%,不是 97%");
 });
 
-test("没有 usage / 空对象不炸", () => {
-  assert.equal(estimateWindowTokens(null), 0);
-  assert.equal(estimateWindowTokens(undefined), 0);
-  assert.equal(estimateWindowTokens({}), 0);
+test("【回归】那条误报的 85% 提醒不该再出现", () => {
+  const real = 53947, bogus = 161206;
+  assert.ok(windowPct(real, DEFAULT_WINDOW_LIMIT) < 85, "真实值远不到提醒线");
+  assert.ok(windowPct(bogus, DEFAULT_WINDOW_LIMIT) >= 85, "累加值会误触发 —— 正是被修掉的那个 bug");
 });
 
-test("iterations 是空数组时退回顶层", () => {
-  const usage = { cache_read_input_tokens: 1234, iterations: [] };
-  assert.equal(estimateWindowTokens(usage), 1234);
+test("不是 message_start 的事件一律返回 0(不参与窗口计算)", () => {
+  assert.equal(prefixFromMessageStart({ type: "content_block_delta" }), 0);
+  assert.equal(prefixFromMessageStart({ type: "message_delta", usage: { cache_read_input_tokens: 9999 } }), 0);
+  assert.equal(prefixFromMessageStart(null), 0);
+  assert.equal(prefixFromMessageStart(undefined), 0);
 });
 
-test("缺字段按 0 计,不产生 NaN", () => {
-  const est = estimateWindowTokens({ cache_read_input_tokens: 500 });
-  assert.equal(est, 500);
-  assert.ok(!Number.isNaN(est));
+test("message_start 缺 usage 不炸、不产生 NaN", () => {
+  const v = prefixFromMessageStart({ type: "message_start", message: {} });
+  assert.equal(v, 0);
+  assert.ok(!Number.isNaN(v));
+});
+
+test("prefixOf 缺字段按 0 计", () => {
+  assert.equal(prefixOf({ cache_read_input_tokens: 500 }), 500);
+  assert.equal(prefixOf({}), 0);
+  assert.equal(prefixOf(null), 0);
 });
 
 test("百分比:85% 提醒线两侧", () => {
