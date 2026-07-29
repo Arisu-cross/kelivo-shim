@@ -30,6 +30,23 @@
   首次上传后回写 `file_id`,之后重启/重部署直接复用。
   使用者在 Telegram 里发一个贴纸、下一句说「入库:名字」即可入库,
   「贴纸清单」看有哪些,「删除贴纸:名字」删——这些管理动作不进对话窗口。
+- **上下文压缩瘦身**(`compact-instructions.js` + `window.js`):长窗口塞满时
+  Claude Code 会自动压缩,把整段对话重写成几千 token 的摘要常驻前缀。本项目的
+  长期记忆在 MCP 记忆库里(`archive_session` 写、`breath` 取),那份转述是重复负担,
+  且被摘要器磨过一层。因此挂 **`PreCompact` 钩子**(经 `--settings` 传 JSON,
+  matcher 省略=匹配全部 trigger),钩子 stdout 会作为额外指令拼进压缩提示词,
+  把摘要压成一行指路;记忆改由 `breath(wake=true)` 取回。
+  **必须三件配套,少一件就会丢记忆**:①钩子瘦身;②人设里有「看见续接标记先
+  `breath(wake=true)` 再开口」;③**窗口用量提醒**——摘要瘦身后,「上次归档到现在」
+  这一段只存在于窗口里。`window.js` 从每轮 usage 估算前缀大小,到
+  `WINDOW_WARN_PCT` 就 Telegram 提醒使用者归档换窗(**只提醒使用者,不往对话窗口
+  里塞任何东西**——伪系统指令引发过事故)。`/debug` 的 `window` 块可查用量与
+  压缩次数;CLI 的 `compact_boundary` 事件带 `pre_tokens`,是压缩发生的硬信号。
+  ⚠️ 估算窗口大小**不能用 usage 顶层字段**:一轮里每次工具调用都是一次请求,
+  顶层是累加值(实测顶层 20 万 / 真实前缀 6.7 万),要取 `iterations` 里最大的那次。
+  相关环境变量:`COMPACT_HOOK`(0=关钩子)、`COMPACT_INSTRUCTIONS`(覆盖文案)、
+  `WINDOW_LIMIT`(默认 167000,= 200k 上下文 − 20000 输出预留 − 13000 压缩缓冲)、
+  `WINDOW_WARN_PCT`(默认 85)。
 
 ## 工作规范
 

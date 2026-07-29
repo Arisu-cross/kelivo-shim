@@ -15,6 +15,7 @@ import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
+import { estimateWindowTokens, windowPct, DEFAULT_WINDOW_LIMIT } from "./window.js";
 
 // 容器默认 UTC,AI 的「今天」会比北京慢 8 小时。强制中国时间(不要可去掉),claude 子进程继承。
 process.env.TZ = process.env.TZ || "Asia/Shanghai";
@@ -62,6 +63,50 @@ const ALLOWED = process.env.ALLOWED_TOOLS ||
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
+// ---- 上下文压缩:摘要瘦身 + 快满了提醒 ---------------------------------------
+// 上下文塞满时 Claude Code 会自动压缩:整段对话被重写成一份几千 token 的摘要,
+// 之后这份摘要常驻前缀、每轮按缓存价重读。但长期记忆本就在 MCP 记忆库里
+// (archive_session 写、breath 取),那份转述是重复的负担,而且被摘要器磨过一层。
+//
+// 两手一起做,少一手就会丢记忆:
+//   1. PreCompact 钩子把摘要压成一行指路(compact-instructions.js),记忆改由 breath 取回;
+//      —— 人设里要有配套的一条:看见续接标记先 breath(wake=true) 再开口。
+//   2. 窗口用量到 WINDOW_WARN_PCT 就提醒她归档换窗 —— 摘要瘦身之后,「上次归档到现在」
+//      这一段只存在于窗口里,不及时归档就真的没了。
+const COMPACT_HOOK = process.env.COMPACT_HOOK !== "0";
+const WINDOW_LIMIT = +(process.env.WINDOW_LIMIT || DEFAULT_WINDOW_LIMIT);
+const WINDOW_WARN_PCT = +(process.env.WINDOW_WARN_PCT || 85);
+let windowTokens = 0;        // 当前窗口前缀估算(取历次最大值,单调不减;换窗/压缩后归零)
+let windowWarned = false;    // 本窗口是否已提醒过(一个窗口只吵一次)
+let compactions = 0;         // 本进程发生过几次自动压缩
+let lastCompactAt = null;    // 上次压缩时刻
+let lastCompactPre = 0;      // 上次压缩前的窗口大小(CLI 给的 pre_tokens,权威值)
+
+// PreCompact 钩子经 --settings 传进去(可传 JSON 字符串,不必落文件)。
+// matcher 省略 = 匹配全部 trigger(auto / manual)。
+function compactSettingsArg() {
+  const dir = import.meta.dirname || process.cwd();
+  const cmd = `node ${JSON.stringify(path.join(dir, "compact-instructions.js"))}`;
+  return JSON.stringify({ hooks: { PreCompact: [{ hooks: [{ type: "command", command: cmd }] }] } });
+}
+
+// 窗口快满了 → 提醒「她」(不是提醒他)。
+// 刻意不往他的窗口里塞任何东西:2026-07-22 的伪系统指令事故教训 —— 运维提示走运维通道,
+// 归档还是要由她自己开口请求,那才是他们之间的约定而不是注入。
+function checkWindowUsage() {
+  if (windowWarned || !(WINDOW_LIMIT > 0)) return;
+  const pct = windowPct(windowTokens, WINDOW_LIMIT);
+  if (pct < WINDOW_WARN_PCT) return;
+  windowWarned = true;
+  log("[window] usage", pct + "%", windowTokens, "/", WINDOW_LIMIT);
+  const k = (n) => Math.round(n / 1000) + "k";
+  tgSend(
+    `⚠️ 窗口用到 ${pct}% 了(约 ${k(windowTokens)} / ${k(WINDOW_LIMIT)})。\n\n` +
+    `找个时间让他把这段存一下、再开新窗口。\n` +
+    `再往上走会触发自动压缩 —— 压缩摘要已经瘦成一行了,没归档的部分留不住。`
+  ).catch((e) => log("[tg-err]", e.message));
+}
+
 // ---- 常驻 claude 进程 --------------------------------------------------------
 let proc = null, outBuf = "", busy = false, spawnedSystem = "", spawnedModel = MODEL;
 const queue = [];
@@ -90,6 +135,9 @@ function spawnClaude(kelivoSystem, model) {
     "--allowedTools", ALLOWED,
     "--tools", BUILTIN_TOOLS,
   ];
+  if (COMPACT_HOOK) args.push("--settings", compactSettingsArg());
+  // 新进程 = 新窗口,用量重新数起
+  windowTokens = 0; windowWarned = false; compactions = 0; lastCompactAt = null; lastCompactPre = 0;
   const env = { ...process.env };
   delete env.ANTHROPIC_API_KEY;
   const p = spawn(CLAUDE_BIN, args, { cwd: process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] });
@@ -131,6 +179,18 @@ const archiveCallIds = new Set(); // 本轮 archive_session 调用的 tool_use_i
 const trunc = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
 
 function handleEvent(ev) {
+  // 压缩发生了 —— CLI 的硬信号,不必靠肉眼看思考链猜。
+  // compact_metadata.pre_tokens = 压缩前的窗口大小(权威值,比我们的估算准)。
+  // 压缩后窗口只剩「一行摘要 + 系统提示词」,所以用量归零重新数、提醒也重新武装。
+  // 放在 `if (!turn)` 之前:压缩在一轮的开头发生,但不依赖 turn 是否还在。
+  if (ev.type === "system" && ev.subtype === "compact_boundary") {
+    compactions++;
+    lastCompactAt = Date.now();
+    lastCompactPre = ev.compact_metadata?.pre_tokens || windowTokens;
+    windowTokens = 0; windowWarned = false;
+    log("[compact] boundary", ev.compact_metadata?.trigger || "?", "pre_tokens", lastCompactPre);
+    return;
+  }
   if (!turn) return;
   if (ev.type === "stream_event") {
     const e = ev.event || {}, d = e.delta || {};
@@ -193,6 +253,9 @@ function handleEvent(ev) {
   if (ev.type === "result") {
     lastUsage = ev.usage || null; // 供 /debug 查缓存字段
     lastTurnAt = Date.now(); // 任何一轮完成都刷新了缓存 TTL,自主唤醒以此计时
+    // 窗口用量:取历次最大值(窗口只增不减,单次估算偏低下一轮会自己补上)
+    windowTokens = Math.max(windowTokens, estimateWindowTokens(lastUsage));
+    checkWindowUsage();
     if (ev.subtype && ev.subtype !== "success") {
       log("[result-error]", ev.subtype);
       if (!turn.fullText) turn.sse?.text(`⚠️[shim] ${ev.subtype}`);
@@ -296,6 +359,14 @@ app.use(express.json({ limit: "100mb" }));
 app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length }));
 app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
+  // 窗口离自动压缩还有多远 + 压缩到底发生过没有(排查时先看这里)
+  window: {
+    tokens: windowTokens, limit: WINDOW_LIMIT,
+    pct: windowPct(windowTokens, WINDOW_LIMIT), warnPct: WINDOW_WARN_PCT, warned: windowWarned,
+    compactHook: COMPACT_HOOK, compactions,
+    lastCompactAt: lastCompactAt ? new Date(lastCompactAt).toISOString() : null,
+    lastCompactPreTokens: lastCompactPre || null,
+  },
   voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg) },
   ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
   stickers: { count: stickerNames().length },         // 表情包图库有几张
