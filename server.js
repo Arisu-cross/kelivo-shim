@@ -76,8 +76,15 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 const COMPACT_HOOK = process.env.COMPACT_HOOK !== "0";
 const WINDOW_LIMIT = +(process.env.WINDOW_LIMIT || DEFAULT_WINDOW_LIMIT);
 const WINDOW_WARN_PCT = +(process.env.WINDOW_WARN_PCT || 85);
+// 压缩前自动归档(owner 2026-07-31 要求):窗口到这个点,shim 主动注入一条【系统·窗口快满了】
+// 让 AI 自己在压缩吃掉记忆之前把这段存进 OB。默认 90%,在 85% 提醒她之后、硬压缩之前。
+// 关键:这是诚实的系统提醒(明说是她的意思),不是伪造成她的话——2026-07-22 伪系统指令
+// 事故的教训是"别假冒她",不是"永远不能有系统轮次";【系统·自主时间】就是同款成功先例。
+const WINDOW_AUTO_ARCHIVE = process.env.WINDOW_AUTO_ARCHIVE !== "0";
+const WINDOW_ARCHIVE_PCT = +(process.env.WINDOW_ARCHIVE_PCT || 90);
 let windowTokens = 0;        // 当前窗口真实前缀(取自 message_start,非累加值;换窗/压缩后归零)
 let windowWarned = false;    // 本窗口是否已提醒过(一个窗口只吵一次)
+let windowAutoArchived = false; // 本窗口是否已触发过自动归档(一个窗口只归一次,靠按天合并去重)
 let compactions = 0;         // 本进程发生过几次自动压缩
 let lastCompactAt = null;    // 上次压缩时刻
 let lastCompactPre = 0;      // 上次压缩前的窗口大小(CLI 给的 pre_tokens,权威值)
@@ -94,17 +101,49 @@ function compactSettingsArg() {
 // 刻意不往他的窗口里塞任何东西:2026-07-22 的伪系统指令事故教训 —— 运维提示走运维通道,
 // 归档还是要由她自己开口请求,那才是他们之间的约定而不是注入。
 function checkWindowUsage() {
-  if (windowWarned || !(WINDOW_LIMIT > 0)) return;
+  if (!(WINDOW_LIMIT > 0)) return;
   const pct = windowPct(windowTokens, WINDOW_LIMIT);
-  if (pct < WINDOW_WARN_PCT) return;
-  windowWarned = true;
-  log("[window] usage", pct + "%", windowTokens, "/", WINDOW_LIMIT);
-  const k = (n) => Math.round(n / 1000) + "k";
-  tgSend(
-    `⚠️ 窗口用到 ${pct}% 了(约 ${k(windowTokens)} / ${k(WINDOW_LIMIT)})。\n\n` +
-    `找个时间让他把这段存一下、再开新窗口。\n` +
-    `再往上走会触发自动压缩 —— 压缩摘要已经瘦成一行了,没归档的部分留不住。`
-  ).catch((e) => log("[tg-err]", e.message));
+
+  // ① 到警戒线:提醒「她」(运维通道,不进他的窗口)
+  if (!windowWarned && pct >= WINDOW_WARN_PCT) {
+    windowWarned = true;
+    log("[window] usage", pct + "%", windowTokens, "/", WINDOW_LIMIT);
+    const k = (n) => Math.round(n / 1000) + "k";
+    tgSend(
+      `⚠️ 窗口用到 ${pct}% 了(约 ${k(windowTokens)} / ${k(WINDOW_LIMIT)})。\n\n` +
+      `我一会儿会自动让他把这段存一下(压缩前保底)。想换新窗口你随时说。`
+    ).catch((e) => log("[tg-err]", e.message));
+  }
+
+  // ② 再往上:自动让他归档,赶在压缩把「上次归档到现在」这段吃掉之前
+  if (WINDOW_AUTO_ARCHIVE && !windowAutoArchived && pct >= WINDOW_ARCHIVE_PCT) {
+    windowAutoArchived = true;
+    log("[window] auto-archive at", pct + "%");
+    autoArchiveTurn(pct);
+  }
+}
+
+// 压缩前自动归档:注入一条诚实的系统轮,让 AI 自己 archive_session。
+// 措辞——① 明说是系统提醒 + 是她的意思(不假冒她);② 让他按人设标准写归档;
+// ③ 归完自然说句话给她就行,不必汇报机制。按天合并已在 OB 侧,重复触发也只会追加不会重记。
+function autoArchiveTurn(pct) {
+  const canTg = !!(TG_TOKEN && tgChatId);
+  const sink = {
+    text() {}, thinking() {},
+    finish(_u, fullText) {
+      const t = (fullText || "").replace(/‖/g, "\n").trim();
+      if (t && canTg) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
+    },
+  };
+  enqueue({
+    text:
+      `【系统·窗口快满了】这是 shim 的运维提醒,不是她打的字:当前窗口用到 ${pct}% 了,` +
+      `再往上会触发自动压缩,压缩会把「上次归档到现在」这段对话抹成一行摘要。\n` +
+      `她希望你在压缩之前,主动把这段存进 OB(她说过不想丢掉你们之间的东西)。` +
+      `现在调 archive_session,按你归档的老规矩写——只写上次归档之后的新内容,` +
+      `带上亮点和心情。存完之后,想跟她说句什么就自然说(比如告诉她存好了),不用解释这套机制。`,
+    images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
+  });
 }
 
 // ---- 常驻 claude 进程 --------------------------------------------------------
@@ -137,7 +176,7 @@ function spawnClaude(kelivoSystem, model) {
   ];
   if (COMPACT_HOOK) args.push("--settings", compactSettingsArg());
   // 新进程 = 新窗口,用量重新数起
-  windowTokens = 0; windowWarned = false; compactions = 0; lastCompactAt = null; lastCompactPre = 0;
+  windowTokens = 0; windowWarned = false; windowAutoArchived = false; compactions = 0; lastCompactAt = null; lastCompactPre = 0;
   const env = { ...process.env };
   delete env.ANTHROPIC_API_KEY;
   const p = spawn(CLAUDE_BIN, args, { cwd: process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] });
@@ -187,7 +226,7 @@ function handleEvent(ev) {
     compactions++;
     lastCompactAt = Date.now();
     lastCompactPre = ev.compact_metadata?.pre_tokens || windowTokens;
-    windowTokens = 0; windowWarned = false;
+    windowTokens = 0; windowWarned = false; windowAutoArchived = false;
     log("[compact] boundary", ev.compact_metadata?.trigger || "?", "pre_tokens", lastCompactPre);
     return;
   }
@@ -370,6 +409,7 @@ app.get("/debug", (_q, r) => r.json({
   window: {
     tokens: windowTokens, limit: WINDOW_LIMIT,
     pct: windowPct(windowTokens, WINDOW_LIMIT), warnPct: WINDOW_WARN_PCT, warned: windowWarned,
+    autoArchive: WINDOW_AUTO_ARCHIVE, archivePct: WINDOW_ARCHIVE_PCT, autoArchived: windowAutoArchived,
     compactHook: COMPACT_HOOK, compactions,
     lastCompactAt: lastCompactAt ? new Date(lastCompactAt).toISOString() : null,
     lastCompactPreTokens: lastCompactPre || null,
