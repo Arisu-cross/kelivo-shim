@@ -48,6 +48,21 @@
   `WINDOW_LIMIT`(默认 167000,= 200k 上下文 − 20000 输出预留 − 13000 压缩缓冲)、
   `WINDOW_WARN_PCT`(默认 85)。
 
+- **压缩闸门(没归档就不许压)**:上面第 ③ 条只把缺口变窄 —— 到阈值归档之后、
+  压缩真正发生之前还会继续聊,那一段照样被抹掉。`PreCompact` 钩子**可以否决压缩**
+  (`{"decision":"block"}`),所以钩子会先问 shim 的 `POST /precompact-gate`:
+  还有没归档的内容就拦下压缩、请他当场 `archive_session`,**成功了(工具返回带成功
+  标记)下一次压缩才放行** → 缺口收敛到 0。
+  **三条底线**:①拦截有预算 `COMPACT_GATE_MAX_BLOCKS`(默认 2),满窗口无限拦会撞上限;
+  ②钩子问不到闸门(超时/不通/坏 JSON/401)一律**放行**,绝不能卡死压缩;
+  ③拦下的同时 shim 自己也排一轮归档请求并校验成功、失败重试(`ARCHIVE_MAX_ATTEMPTS`)。
+  **最后一层**:压缩仍然溜过去时,shim 把内存里留存的原文回放给他补档
+  (`COMPACT_REPLAY`,只在内存、不落盘,成功归档即清空;`/debug.gate` 只报字数不报内容)。
+  相关环境变量:`COMPACT_GATE`、`COMPACT_GATE_MAX_BLOCKS`、`COMPACT_GATE_TIMEOUT_MS`、
+  `COMPACT_REPLAY`、`COMPACT_REPLAY_MAX_CHARS`、`ARCHIVE_MAX_ATTEMPTS`。
+  查状态:`/debug.gate` 的 `{dirty, blocks, lastArchiveAt, replayPending, bufferedChars}`。
+  ⚠️ 这依赖 CLI 的钩子契约,**升级 CLI 要重测**:契约变了不报错,只会安静失效。
+
 ## 工作规范
 
 - 改动走开发分支,不直推 main;commit 说清「改了什么、为什么」。

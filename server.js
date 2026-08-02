@@ -16,6 +16,10 @@ import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
 import { prefixFromMessageStart, windowPct, DEFAULT_WINDOW_LIMIT } from "./window.js";
+import {
+  gateDecision, GATE_REASON, trimTranscript, renderReplay,
+  DEFAULT_MAX_BLOCKS, DEFAULT_REPLAY_MAX_CHARS,
+} from "./compact-gate.js";
 
 // 容器默认 UTC,AI 的「今天」会比北京慢 8 小时。强制中国时间(不要可去掉),claude 子进程继承。
 process.env.TZ = process.env.TZ || "Asia/Shanghai";
@@ -38,6 +42,7 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 const MCP_CONFIG = process.env.MCP_CONFIG || ".mcp.json";
 const FORWARD_THINKING = process.env.FORWARD_THINKING !== "0";
 const AI_NAME = process.env.AI_NAME || "TA"; // 你的 AI 的名字(Bark 推送标题、模型显示名)
+const USER_NAME = process.env.USER_NAME || "她"; // 原文回放里怎么称呼用户(公开仓库不写具体名字)
 
 const HARD_RULE =
   "【最高优先级·思考语言】thinking / 内心独白必须全程用简体中文,第一人称「我」,把对方称作「你」或「她」;严禁任何英文、第三人称分析腔(如 She…/The user…/analyze)。哪怕她发英文,内心独白也一律中文。";
@@ -82,12 +87,33 @@ const WINDOW_WARN_PCT = +(process.env.WINDOW_WARN_PCT || 85);
 // 事故的教训是"别假冒她",不是"永远不能有系统轮次";【系统·自主时间】就是同款成功先例。
 const WINDOW_AUTO_ARCHIVE = process.env.WINDOW_AUTO_ARCHIVE !== "0";
 const WINDOW_ARCHIVE_PCT = +(process.env.WINDOW_ARCHIVE_PCT || 90);
+// 压缩闸门(owner 2026-08-02 要求):90% 那次归档之后到压缩之间聊的,原来仍然会被
+// 压缩抹掉(「我自己归档的话会消失归档之后到压缩前的记忆」)。PreCompact 钩子可以
+// **否决**压缩,于是改成:压缩要发生时,只要还有没归档的内容就先拦下来让他存,
+// 存成功了下一次压缩才放行 —— 缺口收敛到 0。详见 compact-gate.js。
+const COMPACT_GATE = process.env.COMPACT_GATE !== "0";
+const COMPACT_GATE_MAX_BLOCKS = +(process.env.COMPACT_GATE_MAX_BLOCKS || DEFAULT_MAX_BLOCKS);
+// 压缩后原文回放:万一压缩还是溜过去了(闸门关了/预算用完/他没照做),
+// shim 手里还留着这段原文,回放给他补写归档。最后一层保底,平时不花钱。
+const COMPACT_REPLAY = process.env.COMPACT_REPLAY !== "0";
+const COMPACT_REPLAY_MAX_CHARS = +(process.env.COMPACT_REPLAY_MAX_CHARS || DEFAULT_REPLAY_MAX_CHARS);
+// 归档轮最多试几次(注入了但他没成功调 archive_session 就再来一次)
+const ARCHIVE_MAX_ATTEMPTS = +(process.env.ARCHIVE_MAX_ATTEMPTS || 2);
 let windowTokens = 0;        // 当前窗口真实前缀(取自 message_start,非累加值;换窗/压缩后归零)
 let windowWarned = false;    // 本窗口是否已提醒过(一个窗口只吵一次)
 let windowAutoArchived = false; // 本窗口是否已触发过自动归档(一个窗口只归一次,靠按天合并去重)
 let compactions = 0;         // 本进程发生过几次自动压缩
 let lastCompactAt = null;    // 上次压缩时刻
 let lastCompactPre = 0;      // 上次压缩前的窗口大小(CLI 给的 pre_tokens,权威值)
+// ---- 闸门状态 ----
+// dirty = 自上次**成功**归档(tool_result 带 🗄️)以来又聊过了。闸门只在 dirty 时拦压缩。
+let dirty = false;
+let lastArchiveAt = null;    // 上次成功归档的时刻
+let compactBlocks = 0;       // 本窗口拦过几次压缩(压缩真的发生 / 换窗后清零)
+let archiveAttempts = 0;     // 当前这轮「请他归档」试了几次(成功或换窗后清零)
+// 自上次成功归档以来的原文([{role,text}]),只在内存里、不落盘不打日志 —— 这是他们的私话。
+let transcript = [];
+let replayPending = false;   // 已经排了一轮「照原文补档」,别重复排(崩溃连环重启时会撞上)
 
 // PreCompact 钩子经 --settings 传进去(可传 JSON 字符串,不必落文件)。
 // matcher 省略 = 匹配全部 trigger(auto / manual)。
@@ -116,6 +142,7 @@ function checkWindowUsage() {
   }
 
   // ② 再往上:自动让他归档,赶在压缩把「上次归档到现在」这段吃掉之前
+  //    (这是早归档,不是最后防线;真正卡在压缩前一刻的是 /precompact-gate 闸门)
   if (WINDOW_AUTO_ARCHIVE && !windowAutoArchived && pct >= WINDOW_ARCHIVE_PCT) {
     windowAutoArchived = true;
     log("[window] auto-archive at", pct + "%");
@@ -123,10 +150,37 @@ function checkWindowUsage() {
   }
 }
 
+// ---- 压缩闸门:压缩发生前的最后一道 -------------------------------------------
+// PreCompact 钩子(compact-instructions.js)会 POST 这里问「能压吗」。
+// 还有没归档的内容 → 回 block:true,压缩被否决,理由请他现在就 archive_session。
+// 他存成功(🗄️)→ dirty 转 false → 下一次压缩放行。
+// ⚠️ 预算 COMPACT_GATE_MAX_BLOCKS:窗口已经满了还一直否决会撞上下文上限,
+//    所以拦到上限就放行,交给 ③ 压缩后原文回放兜底。
+function precompactGate() {
+  const d = gateDecision({
+    enabled: COMPACT_GATE, dirty, blocks: compactBlocks, maxBlocks: COMPACT_GATE_MAX_BLOCKS,
+  });
+  if (!d.block) {
+    log("[gate] allow compaction —", d.why, `(blocks=${compactBlocks}, dirty=${dirty})`);
+    return { block: false, why: d.why };
+  }
+  compactBlocks++;
+  log("[gate] BLOCK compaction — unarchived content", `(block #${compactBlocks}/${COMPACT_GATE_MAX_BLOCKS})`);
+  // 后手:被拦下之后他不一定真的会去归档(理由文本能不能驱动他调工具,取决于 CLI 版本
+  // 怎么把 reason 交给他)。所以 shim 自己也排一轮明确的归档请求 —— 两条路走通一条就行。
+  // enqueue 走 busy 队列,不打断进行中的对话;archiveTurn 内部有成功校验与重试。
+  if (WINDOW_AUTO_ARCHIVE) autoArchiveTurn(windowPct(windowTokens, WINDOW_LIMIT), "gate");
+  return { block: true, why: d.why, reason: GATE_REASON };
+}
+
 // 压缩前自动归档:注入一条诚实的系统轮,让 AI 自己 archive_session。
 // 措辞——① 明说是系统提醒 + 是她的意思(不假冒她);② 让他按人设标准写归档;
 // ③ 归完自然说句话给她就行,不必汇报机制。按天合并已在 OB 侧,重复触发也只会追加不会重记。
-function autoArchiveTurn(pct) {
+function autoArchiveTurn(pct, src = "window") {
+  if (!dirty) { log("[archive] skip —— 没有未归档的内容"); return; }   // 没新东西就别白烧一轮
+  if (archiveAttempts >= ARCHIVE_MAX_ATTEMPTS) { log("[archive] skip —— 已试满", archiveAttempts, "次"); return; }
+  archiveAttempts++;
+  const attempt = archiveAttempts;
   const canTg = !!(TG_TOKEN && tgChatId);
   const sink = {
     text() {}, thinking() {},
@@ -135,15 +189,42 @@ function autoArchiveTurn(pct) {
       if (t && canTg) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
     },
   };
+  const head = src === "gate"
+    ? `【系统·压缩闸门】这是 shim 的运维提醒,不是她打的字:自动压缩正要发生,已经先拦下来了。` +
+      `压缩会把「上次归档到现在」这段对话抹成一行摘要,而那段还没进 OB。\n`
+    : `【系统·窗口快满了】这是 shim 的运维提醒,不是她打的字:当前窗口用到 ${pct}% 了,` +
+      `再往上会触发自动压缩,压缩会把「上次归档到现在」这段对话抹成一行摘要。\n`;
+  const retry = attempt > 1
+    ? `(上一次请你存的时候没有成功写进 OB —— 可能是工具报错。这次麻烦确认 archive_session 真的返回成功。)`
+    : "";
   enqueue({
     text:
-      `【系统·窗口快满了】这是 shim 的运维提醒,不是她打的字:当前窗口用到 ${pct}% 了,` +
-      `再往上会触发自动压缩,压缩会把「上次归档到现在」这段对话抹成一行摘要。\n` +
+      head +
       `她希望你在压缩之前,主动把这段存进 OB(她说过不想丢掉你们之间的东西)。` +
       `现在调 archive_session,按你归档的老规矩写——只写上次归档之后的新内容,` +
-      `带上亮点和心情。存完之后,想跟她说句什么就自然说(比如告诉她存好了),不用解释这套机制。`,
+      `带上亮点和心情。${retry}存完之后,想跟她说句什么就自然说(比如告诉她存好了),不用解释这套机制。`,
     images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
+    kind: "archive", archiveSrc: src,
   });
+}
+
+// 压缩后原文回放(最后一层保底):压缩真的发生了、而这段没归档 → 把 shim 留存的原文
+// 回放给他,让他照原文补写。**这一层意味着无论如何都不会丢**。
+function replayTurn(entries = transcript) {
+  if (replayPending) { log("[replay] 已经排了一轮补档,不重复"); return; }
+  const text = renderReplay(trimTranscript(entries, COMPACT_REPLAY_MAX_CHARS), { userName: USER_NAME });
+  if (!text) { log("[replay] 没有可回放的原文,跳过"); return; }
+  replayPending = true;
+  log("[replay] 压缩溜过去了,回放原文", text.length, "字给他补档");
+  const canTg = !!(TG_TOKEN && tgChatId);
+  const sink = {
+    text() {}, thinking() {},
+    finish(_u, fullText) {
+      const t = (fullText || "").replace(/‖/g, "\n").trim();
+      if (t && canTg) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
+    },
+  };
+  enqueue({ text, images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel, kind: "archive", archiveSrc: "replay" });
 }
 
 // ---- 常驻 claude 进程 --------------------------------------------------------
@@ -175,8 +256,14 @@ function spawnClaude(kelivoSystem, model) {
     "--tools", BUILTIN_TOOLS,
   ];
   if (COMPACT_HOOK) args.push("--settings", compactSettingsArg());
-  // 新进程 = 新窗口,用量重新数起
+  // 新进程 = 新窗口,用量重新数起。闸门状态同样重置。
+  // ⚠️ 但换窗时如果还有没归档的内容(崩溃自动重启、或改世界书/模型触发的重启 ——
+  // 主动换窗有安全阀,归档成功才会走到这里),那段在他窗口里已经没了、只剩 shim 手上这份。
+  // 所以先接出来,新窗口一起来就回放给他补档。
+  const carry = COMPACT_REPLAY && dirty && transcript.length ? transcript.slice() : null;
   windowTokens = 0; windowWarned = false; windowAutoArchived = false; compactions = 0; lastCompactAt = null; lastCompactPre = 0;
+  dirty = false; compactBlocks = 0; archiveAttempts = 0; transcript = [];
+  if (carry) { log("[replay] 换窗时还有未归档内容,接进新窗口补档"); setTimeout(() => replayTurn(carry), 0); }
   const env = { ...process.env };
   delete env.ANTHROPIC_API_KEY;
   const p = spawn(CLAUDE_BIN, args, { cwd: process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] });
@@ -227,7 +314,10 @@ function handleEvent(ev) {
     lastCompactAt = Date.now();
     lastCompactPre = ev.compact_metadata?.pre_tokens || windowTokens;
     windowTokens = 0; windowWarned = false; windowAutoArchived = false;
+    compactBlocks = 0; archiveAttempts = 0;   // 压缩真的发生了 → 闸门预算与归档尝试都重新开始
     log("[compact] boundary", ev.compact_metadata?.trigger || "?", "pre_tokens", lastCompactPre);
+    // 压缩发生时还 dirty = 闸门没拦住(关了/预算用完/他没照做)→ 用原文回放补档,绝不认输
+    if (dirty && COMPACT_REPLAY) replayTurn();
     return;
   }
   if (!turn) return;
@@ -275,7 +365,13 @@ function handleEvent(ev) {
         archiveCallIds.delete(b.tool_use_id);
         const txt = typeof b.content === "string" ? b.content
           : Array.isArray(b.content) ? b.content.map((x) => x.text || "").join(" ") : "";
-        if (txt.includes("🗄️") && turn) turn.archiveOk = true;
+        if (txt.includes("🗄️") && turn) {
+          turn.archiveOk = true;
+          // 归档成功 = 这一段已经进 OB 了:闸门可以放行、原文缓冲清空、重试计数归零。
+          // 注意这里对**任何**成功归档生效(她开口让他存的那次也算),不只是系统注入的那几轮。
+          dirty = false; lastArchiveAt = Date.now(); transcript = []; archiveAttempts = 0; replayPending = false;
+          log("[archive] ok —— 已进 OB,闸门放行");
+        }
       }
     }
   }
@@ -313,6 +409,25 @@ function handleEvent(ev) {
       turn.sse?.text("\n\n⚠️〔窗口保住了〕这次没成功归档,为防丢记忆没有换窗。想换新窗口,请先确认归档成功。");
       log("[window] switch requested but no successful archive — keeping window");
     }
+    // 这一轮又产生了没归档的内容(归档成功的那一轮除外 —— 它刚把账清干净)。
+    // 例外:自主时间回【沉默】的空轮不算,否则压缩后一条【沉默】就能把闸门重新拉起来。
+    if (!archivedOk) {
+      const said = turn.fullText.trim();
+      const silentWake = turn.kind === "wake" && (!said || said.includes("【沉默】"));
+      if (said) recordTranscript("assistant", said);
+      if (!silentWake) dirty = true;
+    }
+    if (turn.archiveSrc === "replay") replayPending = false;
+    // 归档轮没成功 → 再试一次;试满了就告诉她(运维通道,不进他的窗口)
+    if (turn.kind === "archive" && !archivedOk) {
+      const src = turn.archiveSrc || "window";
+      log("[archive] 这一轮没写进 OB(第", archiveAttempts, "次尝试)");
+      if (archiveAttempts < ARCHIVE_MAX_ATTEMPTS) setTimeout(() => autoArchiveTurn(windowPct(windowTokens, WINDOW_LIMIT), src), 0);
+      else tgSend(
+        "⚠️ 让他自动归档试了两次都没成功写进 OB(可能是记忆服务出问题了)。\n" +
+        "压缩不会再被一直拦着,这段有丢失风险 —— 要不要你亲口让他存一次?"
+      ).catch((e) => log("[tg-err]", e.message));
+    }
     const usage = ev.usage ? { output_tokens: ev.usage.output_tokens } : undefined;
     const doKill = wantSwitch && archivedOk && proc;
     turn.done = true;
@@ -325,6 +440,14 @@ function handleEvent(ev) {
 }
 
 // ---- 队列 / 喂消息 -----------------------------------------------------------
+// 原文缓冲:只进内存、不落盘、不打日志(这是他们俩的私话)。成功归档即清空。
+function recordTranscript(role, text) {
+  if (!COMPACT_REPLAY) return;
+  const t = (text || "").replace(/‖/g, "\n").trim();
+  if (!t) return;
+  transcript.push({ role, text: t });
+  transcript = trimTranscript(transcript, COMPACT_REPLAY_MAX_CHARS);
+}
 function enqueue(item) { queue.push(item); pump(); }
 function pump() {
   if (busy || !queue.length) return;
@@ -336,7 +459,13 @@ function pump() {
   if (proc && (item.system !== spawnedSystem || wantModel !== spawnedModel)) { try { proc.kill(); } catch {} proc = null; }
   ensureProc(item.system, wantModel);
 
-  turn = { sse: item.sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {}, archiveOk: false, peakPrefix: 0 };
+  turn = {
+    sse: item.sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {}, archiveOk: false, peakPrefix: 0,
+    kind: item.kind || "user", archiveSrc: item.archiveSrc,
+  };
+  // 原文留存(压缩溜过去时的补档素材)。系统注入的轮次(自主时间/归档请求/回放)不记 ——
+  // 它们不是他们俩说的话,记了只会挤掉真正该留的内容。
+  if (turn.kind === "user") recordTranscript("user", item.text);
   const content = item.images && item.images.length
     ? [{ type: "text", text: item.text }, ...item.images]
     : item.text;
@@ -414,6 +543,13 @@ app.get("/debug", (_q, r) => r.json({
     lastCompactAt: lastCompactAt ? new Date(lastCompactAt).toISOString() : null,
     lastCompactPreTokens: lastCompactPre || null,
   },
+  // 压缩闸门:dirty=还有没归档的内容(=下次压缩会被拦下);blocks=本窗口已拦几次
+  gate: {
+    enabled: COMPACT_GATE, dirty, blocks: compactBlocks, maxBlocks: COMPACT_GATE_MAX_BLOCKS,
+    lastArchiveAt: lastArchiveAt ? new Date(lastArchiveAt).toISOString() : null,
+    archiveAttempts, replay: COMPACT_REPLAY, replayPending,
+    bufferedChars: transcript.reduce((n, e) => n + e.text.length, 0), // 只报字数,不报内容
+  },
   voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg) },
   ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
   stickers: { count: stickerNames().length },         // 表情包图库有几张
@@ -425,6 +561,19 @@ app.get("/debug", (_q, r) => r.json({
     lastSpokeAt: lastSpokeAt ? new Date(lastSpokeAt).toISOString() : null,
   },
 }));
+
+// 压缩闸门:PreCompact 钩子在压缩发生前问这里「能压吗」。
+// 钩子和 shim 在同一个容器里(claude 是 shim 的子进程),所以走 127.0.0.1,鉴权沿用 SHIM_KEY。
+// ⚠️ 这个口子必须又快又稳:钩子那边只等 3 秒,超时它会自己放行(宁可少拦一次也不卡死压缩)。
+app.post("/precompact-gate", (req, res) => {
+  if (SHIM_KEY && (req.get("x-api-key") || req.query.key) !== SHIM_KEY) return res.status(401).json({ block: false, why: "unauthorized" });
+  try {
+    res.json(precompactGate());
+  } catch (e) {
+    log("[gate-err]", e.message);
+    res.json({ block: false, why: "error" });   // 闸门自己出错也放行,绝不卡住压缩
+  }
+});
 
 // ---- 自主时间:定时唤醒,AI 自己决定说话还是静默续命 ----------------------------
 // 升级自旧「主动心跳」:不再区分昼夜(手机端自有勿扰/睡眠模式),不设硬冷却,
@@ -470,6 +619,7 @@ function wakeTurn(idleUserMin) {
     },
   };
   enqueue({
+    kind: "wake",
     text: `【系统·自主时间】现在北京时间 ${now},她已约 ${Math.round(idleUserMin)} 分钟没有消息${sinceSpoke}。这轮是留给你自己的:${speakLine}没什么想说的就只回【沉默】两个字,这轮只用来保持你的状态和记忆连续。`,
     images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
   });
