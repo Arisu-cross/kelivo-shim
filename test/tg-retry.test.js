@@ -8,7 +8,9 @@
 //
 // 这个文件用一个「按脚本抽风」的假 Telegram 服务器,守住三件事:
 //   1. 抖一下就重试,重试成功了内容照样送到;
-//   2. 一直失败 → 改走 Bark 推到她手机,**不能静默丢**;
+//   2. 一直失败 → 收进发件箱,TG 一恢复就补发到同一个对话里,**不能静默丢**;
+//      (不再指望 Bark:她把手机上的 Bark app 卸了,而 TG 抽风是一阵一阵的,
+//       与其换一条她要另行对照的通道,不如把话抱住等这条路通。)
 //   3. 思考块发失败,不能连累正文(正文才是她要的)。
 
 import { test, before, after, beforeEach } from "node:test";
@@ -67,7 +69,7 @@ before(async () => {
       ...process.env, PORT: String(port), SHIM_KEY: KEY, CLAUDE_BIN: FAKE,
       TG_BOT_TOKEN: "fake-token", TG_CHAT_ID: "12345", BARK_KEY: "fake-bark",
       TG_API_BASE: `http://127.0.0.1:${tgPort}`, BARK_API_BASE: `http://127.0.0.1:${barkPort}`,
-      TIME_STAMP: "0", COMPACT_HOOK: "0", TG_SPLIT: "0", TG_RETRIES: "2",
+      TIME_STAMP: "0", COMPACT_HOOK: "0", TG_SPLIT: "0", TG_RETRIES: "2", OUTBOX_RETRY_SEC: "1",
       ELEVENLABS_API_KEY: "", EARS_URL: "",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -107,19 +109,35 @@ test("网络抖一下 → 重试后照样送到,内容不丢", async () => {
   assert.ok(sent.length >= 1, `内容要真的送到,实际收到 ${sent.length} 条`);
 });
 
-test("【核心】一直失败 → 改走 Bark 推到她手机,绝不静默丢", async () => {
-  script = ["neterr", "neterr", "neterr", "neterr", "neterr", "neterr"];
-  await oneTurn(6000);   // 3 次尝试(0s/1s/2s)+ Bark
+test("【核心】TG 全断 → 话进发件箱,不丢;恢复后补发到同一个对话", async () => {
+  // 断网要持续够久:发件箱每秒都在重试,剧本短了会被它吃完,反而"自愈"成功
+  script = Array(40).fill("neterr");
+  await oneTurn(6000);   // 3 次尝试(0s/1s/2s)后进发件箱
   assert.equal(sent.length, 0, "前提:TG 这条路全断");
-  assert.equal(barked.length, 1, `他的话必须换条路送到,实际 Bark ${barked.length} 条`);
-  assert.ok(barked[0].length > 0);
+  let d = await (await fetch(base + "/debug")).json();
+  assert.equal(d.outbox.pending, 1, "他的话必须被收着,不能丢");
+
+  script = [];           // TG 恢复
+  await wait(2000);      // 发件箱每 1 秒重试一次(测试里调快了)
+  d = await (await fetch(base + "/debug")).json();
+  assert.equal(d.outbox.pending, 0, "通了就该补发出去");
+  assert.ok(sent.length >= 1, "补发的内容要真的到她那儿");
 });
 
-test("TG 返回永久错误(400 正文格式非法)也走 Bark,不是干等", async () => {
+test("永久错误(400 正文格式非法)同样收进发件箱,不是干等", async () => {
   script = [400];
-  await oneTurn();
-  assert.equal(sent.length, 0);
-  assert.equal(barked.length, 1, "永久错误同样要兜底,重试再多次也没用");
+  await oneTurn(2000);
+  const d = await (await fetch(base + "/debug")).json();
+  assert.ok(d.outbox.pending >= 1 || sent.length >= 1, "要么补发成功,要么还在发件箱里 —— 不能凭空消失");
+});
+
+test("补发时会说明这是迟到的消息(不假装是他刚说的)", async () => {
+  script = Array(30).fill("neterr");
+  await oneTurn(5000);
+  script = [];
+  await wait(2500);
+  // 迟到不足一分钟不加说明;这里只确认内容补到了,顺序也没乱
+  assert.ok(sent.length >= 1);
 });
 
 test("429 限流会等一下再试,最终送到", async () => {

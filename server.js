@@ -558,6 +558,8 @@ app.get("/debug", (_q, r) => r.json({
   },
   voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg) },
   ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
+  // 发件箱:发不出去、正等着补发的消息(平时应恒为 0;不为 0 = TG 那条路正在抽风)
+  outbox: { pending: outbox.length, oldestSec: outbox.length ? Math.round((Date.now() - outbox[0].since) / 1000) : 0 },
   stickers: { count: stickerNames().length },         // 表情包图库有几张
   wake: {
     bark: !!BARK_KEY,
@@ -864,21 +866,72 @@ async function tgSendSticker(name) {
 
 // 一轮回复的统一出口:切语音/贴纸/文字段,按出现顺序发。
 // 贴纸只在文字段里找——语音段的内容整段送 TTS,不该被解析。
-// 送达他的回复:先走 Telegram(带重试),**彻底失败就改走 Bark 推到她手机**。
-// 「他的话送不到她那儿」是这个系统最不该发生的事 —— 宁可换个难看的通道,也不能没有。
-// 2026-08-02 之前是 `.catch(log)` 了事,一晚上静默丢了 4 条。
+// ---- 发件箱:发不出去的话不丢,等 TG 通了补发 --------------------------------
+//
+// 「他的话送不到她那儿」是这个系统最不该发生的事。2026-08-02 之前这里是 `.catch(log)`
+// 了事,一晚上静默丢了 4 条(她的感受是「他今天怎么总是吞消息」)。
+//
+// 为什么不是推 Bark:她把手机上的 Bark app 卸了(理由是「反正一直稳定在 tg」——
+// 而今晚恰恰是 tg 掉的)。而且 TG 抽风是**一阵一阵**的,不是长期断:
+// 与其换一条她要另行对照的通道,不如把话抱住,等这条路通了补发进同一个对话、按原顺序。
+// BARK_KEY 若还配着,只当最后的最后(默认已无用,留着不碍事)。
+const OUTBOX_RETRY_SEC = +(process.env.OUTBOX_RETRY_SEC || 30);   // 多久重试一次
+const OUTBOX_MAX_MIN = +(process.env.OUTBOX_MAX_MIN || 120);      // 超过这么久还没送出去就放弃(并大声记一笔)
+const OUTBOX_MAX = +(process.env.OUTBOX_MAX || 20);               // 最多攒几条,防止无限堆积
+const OUTBOX_LATE_NOTE = process.env.OUTBOX_LATE_NOTE !== "0";    // 迟到的消息前加一句说明
+const outbox = [];          // [{ text, since, tries }]
+let outboxTimer = null;
+
+function outboxPush(text) {
+  if (outbox.length >= OUTBOX_MAX) {
+    const dropped = outbox.shift();
+    log("[outbox] ⚠️ 积压超过", OUTBOX_MAX, "条,丢掉最旧的:", dropped.text.slice(0, 40));
+  }
+  outbox.push({ text, since: Date.now(), tries: 0 });
+  log("[outbox] 收着了,待补发", outbox.length, "条");
+  if (!outboxTimer) outboxTimer = setInterval(outboxFlush, OUTBOX_RETRY_SEC * 1000);
+}
+
+async function outboxFlush() {
+  while (outbox.length) {
+    const item = outbox[0];
+    // 太久没送出去 = 这条已经过时了,再补发只会让她一头雾水。放弃但大声记一笔。
+    if (Date.now() - item.since > OUTBOX_MAX_MIN * 60000) {
+      outbox.shift();
+      log("[outbox] ⚠️ 攒了超过", OUTBOX_MAX_MIN, "分钟仍发不出去,放弃这条:", item.text.slice(0, 60));
+      continue;
+    }
+    item.tries++;
+    try {
+      if (OUTBOX_LATE_NOTE && Date.now() - item.since > 60000) {
+        // 迟到超过一分钟才解释一句,免得她看见一条突然冒出来的旧消息一头雾水。
+        // 诚实署名 shim,不假装是他说的。
+        await tgSend("〔下面这条是刚才没发出去的,网络恢复后补上〕");
+      }
+      await tgSendReply(item.text);
+      outbox.shift();
+      log("[outbox] 补发成功,还剩", outbox.length, "条");
+    } catch (e) {
+      log("[outbox] 还是发不出去(第", item.tries, "次),等下一轮:", e.message);
+      return;                                   // 这条没成就别急着发后面的,保住顺序
+    }
+  }
+  if (!outbox.length && outboxTimer) { clearInterval(outboxTimer); outboxTimer = null; }
+}
+
+// 送达他的回复:先走 Telegram(tgApi 自带 1s/2s/4s 重试),仍然失败就进发件箱等补发。
 async function tgDeliver(text) {
   const t = (text || "").trim();
   if (!t) return;
+  if (outbox.length) {                          // 有积压就先补旧的,保住她读到的顺序
+    await outboxFlush().catch(() => {});
+    if (outbox.length) { outboxPush(t); return; }
+  }
   try {
     await tgSendReply(t);
   } catch (e) {
-    log("[tg-err] 发送失败,改走 Bark:", e.message);
-    if (!BARK_KEY) { log("[tg-err] ⚠️ 没配 Bark,这条真的丢了:", t.slice(0, 60)); return; }
-    // Bark 收不了语音/贴纸标记,把它们剥成普通文字再推
-    const plain = t.replace(/\[语音\]|\[\/语音\]/g, "").replace(/[[［]贴纸[:：][^\]］]*[\]］]/g, "").trim();
-    try { await barkPush(plain || t); log("[tg-err] 已用 Bark 补送"); }
-    catch (e2) { log("[bark-err] Bark 也失败,这条丢了:", e2.message); }
+    log("[tg-err] 发送失败,先收进发件箱:", e.message);
+    outboxPush(t);
   }
 }
 
