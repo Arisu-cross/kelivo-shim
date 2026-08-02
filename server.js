@@ -315,6 +315,12 @@ function handleEvent(ev) {
     lastCompactPre = ev.compact_metadata?.pre_tokens || windowTokens;
     windowTokens = 0; windowWarned = false; windowAutoArchived = false;
     compactBlocks = 0; archiveAttempts = 0;   // 压缩真的发生了 → 闸门预算与归档尝试都重新开始
+    // ⚠️ 本轮此前那次 message_start 报的是**压缩前**的前缀(满窗),那份上下文已经不存在了。
+    // 不清掉的话,`result` 里 `windowTokens = turn.peakPrefix` 会把压缩后的窗口记成满窗:
+    //   → 压缩后立刻给用户发一条假的「窗口 100%」提醒;
+    //   → 85%/90% 两个标志被这次假读数用掉,这个窗口后面真到 90% 时早归档不再触发。
+    // 2026-08-02 线上实测到:压缩后 /debug 显示 46%,而 warned/autoArchived 都是 true。
+    if (turn) turn.peakPrefix = 0;
     log("[compact] boundary", ev.compact_metadata?.trigger || "?", "pre_tokens", lastCompactPre);
     // 压缩发生时还 dirty = 闸门没拦住(关了/预算用完/他没照做)→ 用原文回放补档,绝不认输
     if (dirty && COMPACT_REPLAY) replayTurn();
