@@ -10,7 +10,8 @@
 //   含 "archive_session" → 演成功归档(tool_use + tool_result 带 🗄️)
 //   含 "ARCHIVE_FAIL"    → 演归档失败(tool_result 不带 🗄️)
 //   含 "COMPACT_NOW"     → 先发一个 compact_boundary,再正常回一轮
-// 另外 FAKE_PREFIX 环境变量决定 message_start 报的窗口前缀大小。
+// 另外两个环境变量:FAKE_PREFIX 决定 message_start 报的窗口前缀大小;
+// FAKE_WAKE_TOOL 让「自主时间」那一轮演成他去做了点自己的事(调该工具,然后只回【沉默】)。
 
 let buf = "";
 const PREFIX = +(process.env.FAKE_PREFIX || 1000);
@@ -27,6 +28,9 @@ process.stdin.on("data", (c) => {
     const text = typeof content === "string"
       ? content
       : Array.isArray(content) ? content.map((b) => b.text || "").join(" ") : "";
+    // FAKE_ECHO=1:把真正收到的整段注入文本回显到 stderr,让测试能断言**载荷本身**
+    // (只看 shim 日志说「走了宽版分支」是不够的 —— 分支对了、传的参数错了照样是死代码)
+    if (process.env.FAKE_ECHO === "1") process.stderr.write("[fake] recv: " + text.replace(/\n/g, "⏎") + "\n");
     setTimeout(() => reply(text), 5);
   }
 });
@@ -39,6 +43,15 @@ function reply(text) {
     out({ type: "system", subtype: "compact_boundary", compact_metadata: { trigger: "auto", pre_tokens: 160000 } });
   }
   out({ type: "stream_event", event: { type: "message_start", message: { usage: { input_tokens: 3, cache_read_input_tokens: PREFIX } } } });
+
+  // 自主时间:演成他拿这一轮去做了自己的事(调一个工具),做完只回【沉默】不打扰她。
+  if (text.includes("【系统·自主时间】") && process.env.FAKE_WAKE_TOOL) {
+    out({ type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_fake_w", name: process.env.FAKE_WAKE_TOOL } } });
+    out({ type: "stream_event", event: { type: "content_block_stop", index: 0 } });
+    out({ type: "stream_event", event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "【沉默】" } } });
+    out({ type: "result", subtype: "success", usage: { output_tokens: 2 } });
+    return;
+  }
 
   const wantArchive = text.includes("archive_session");
   const wantFail = text.includes("ARCHIVE_FAIL");

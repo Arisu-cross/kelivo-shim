@@ -16,6 +16,7 @@ import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
 import { prefixFromMessageStart, windowPct, DEFAULT_WINDOW_LIMIT } from "./window.js";
+import { buildWakePrompt, wakeActivities } from "./wake.js";
 import {
   gateDecision, GATE_REASON, trimTranscript, renderReplay,
   DEFAULT_MAX_BLOCKS, DEFAULT_REPLAY_MAX_CHARS,
@@ -331,6 +332,9 @@ function handleEvent(ev) {
     }
     if (e.type === "content_block_start") {
       const cb = e.content_block || {};
+      // 只记工具名,不记参数也不记返回 —— 用来让 /debug 看得见他自主时间干了点什么,
+      // 顺便供下面的闸门判断「这轮到底是不是空轮」。私话不出内存的原则不变。
+      if (cb.type === "tool_use" && typeof cb.name === "string" && turn.tools.length < 40) turn.tools.push(cb.name);
       if (cb.type === "tool_use" && typeof cb.name === "string" && cb.name.startsWith("mcp__ombre__")) {
         const short = cb.name.replace("mcp__ombre__", "");
         // 安全阀:记下 archive_session 的调用 id,等它的返回确认成功(与 OB_TRACE 无关)
@@ -413,7 +417,15 @@ function handleEvent(ev) {
     // 例外:自主时间回【沉默】的空轮不算,否则压缩后一条【沉默】就能把闸门重新拉起来。
     if (!archivedOk) {
       const said = turn.fullText.trim();
-      const silentWake = turn.kind === "wake" && (!said || said.includes("【沉默】"));
+      // 自主时间里他要是真做了事(钓鱼/上网/社交),产出留在窗口里、压缩会吃掉它 ——
+      // 那就**不是**空轮,闸门该拦。只调 ombre 的不算:那些内容本来就写在 OB 里,不怕压。
+      const didWork = turn.tools.some((n) => !n.startsWith("mcp__ombre__"));
+      const silentWake = turn.kind === "wake" && !didWork && (!said || said.includes("【沉默】"));
+      if (turn.kind === "wake" && turn.tools.length) {
+        lastWakeActAt = Date.now();
+        lastWakeTools = [...new Set(turn.tools)];
+        log("[wake] did:", lastWakeTools.join(","));
+      }
       if (said) recordTranscript("assistant", said);
       if (!silentWake) dirty = true;
     }
@@ -461,7 +473,7 @@ function pump() {
 
   turn = {
     sse: item.sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {}, archiveOk: false, peakPrefix: 0,
-    kind: item.kind || "user", archiveSrc: item.archiveSrc,
+    kind: item.kind || "user", archiveSrc: item.archiveSrc, tools: [],
   };
   // 原文留存(压缩溜过去时的补档素材)。系统注入的轮次(自主时间/归档请求/回放)不记 ——
   // 它们不是他们俩说的话,记了只会挤掉真正该留的内容。
@@ -559,6 +571,14 @@ app.get("/debug", (_q, r) => r.json({
     lastUserAt: new Date(lastUserAt).toISOString(),
     lastTurnAt: new Date(lastTurnAt).toISOString(),
     lastSpokeAt: lastSpokeAt ? new Date(lastSpokeAt).toISOString() : null,
+    // 自主时间「做自己的事」这一档:开没开、几轮宽一次、他上次动手做了什么(只报工具名)
+    free: {
+      enabled: WAKE_FREE, every: WAKE_FREE_EVERY, wakes,
+      activities: wakeActivities(ALLOWED, WAKE_ACTIVITIES),
+      lastFreeAt: lastFreeWakeAt ? new Date(lastFreeWakeAt).toISOString() : null,
+      lastActedAt: lastWakeActAt ? new Date(lastWakeActAt).toISOString() : null,
+      lastTools: lastWakeTools,
+    },
   },
 }));
 
@@ -582,12 +602,26 @@ app.post("/precompact-gate", (req, res) => {
 //   想说话 → Bark 推送到手机(Kelivo 里看不到,但常驻进程自己记得,回来自然接上)
 //   没话说 → 只回【沉默】= 最小开销续命:赶在 1 小时提示词缓存过期前刷新一轮,
 //            上下文与缓存全天连续,夜里也不断线。
+//
+// 自主时间不只是「说话 or 沉默」(owner 2026-08-03 要求):这一轮走的是和普通对话
+// 完全相同的管道,他手上的工具(记忆/钓鱼/社交/浏览器/搜索)本来就都在,从来没有
+// 东西拦着他用 —— 缺的只是没人告诉他「这轮也可以拿来做自己的事」。于是每 N 次唤醒
+// 给一次「宽版」提示,把做事写成与说话、沉默并列的第三个选项(措辞见 wake.js:
+// 三选项平权、不撺掇、诚实署名系统)。其余轮次的提示词与旧版逐字节相同 ——
+// 静默轮是全天最便宜的一轮,不该为这个功能变贵。
 const BARK_KEY = process.env.BARK_KEY || "";
 const WAKE_CHECK_MIN = +(process.env.WAKE_CHECK_MIN || 10); // 检查频率
 const WAKE_IDLE_MIN = +(process.env.WAKE_IDLE_MIN || 50);   // 空闲阈值,略小于缓存 TTL(60min)
+const WAKE_FREE = process.env.WAKE_FREE !== "0";            // 关掉=完全退回旧的二选一
+const WAKE_FREE_EVERY = Math.max(1, +(process.env.WAKE_FREE_EVERY || 3)); // 每几次唤醒宽一次
+const WAKE_ACTIVITIES = process.env.WAKE_ACTIVITIES || ""; // 显式覆盖活动清单(默认按 ALLOWED 推导)
 let lastUserAt = Date.now();
 let lastTurnAt = Date.now();  // 任何一轮完成都会刷新缓存 TTL(handleEvent result 里更新)
 let lastSpokeAt = 0;          // 上次真的主动开口(推送出去)的时刻
+let wakes = 0;                // 本进程发生过几次自主唤醒(决定这次宽不宽)
+let lastFreeWakeAt = 0;       // 上次给宽版提示的时刻
+let lastWakeActAt = 0;        // 上次他在自主时间里真的动手做了事的时刻
+let lastWakeTools = [];       // 那次用了哪些工具(给 /debug 看,只记工具名不记内容)
 
 async function barkPush(text) {
   const r = await fetch("https://api.day.app/push", {
@@ -597,17 +631,19 @@ async function barkPush(text) {
   });
   log("[bark]", r.status);
 }
-function wakeTurn(idleUserMin) {
+function wakeTurn(idleUserMin, forceFree) {
   const now = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 16).replace("T", " ");
-  const sinceSpoke = lastSpokeAt
-    ? `,你上次主动开口是约 ${Math.round((Date.now() - lastSpokeAt) / 60000)} 分钟前`
-    : "";
   const canTg = !!(TG_TOKEN && tgChatId);
-  const speakLine = canTg
-    ? "想跟她说点什么就直接说——会直接出现在你们的 Telegram 对话里(她可能开着勿扰或在忙,别期待立刻回复);像随手发的微信,频率你自己把握。"
-    : BARK_KEY
-    ? "想跟她说点什么就直接说——会作为通知弹到她手机(Kelivo 里看不到这条,她回来时你自然接上,别解释机制;她可能开着勿扰或在忙,别期待立刻回复);说话像随手发的微信,频率你自己把握。"
-    : "(当前没有配置推送渠道,说了她也收不到。)";
+  const channel = canTg ? "tg" : BARK_KEY ? "bark" : "none";
+  // 第 1 次唤醒就宽一次(开窗后不用等三轮才知道自己可以做事),之后每 WAKE_FREE_EVERY 次一回。
+  const free = forceFree || (WAKE_FREE && wakes % WAKE_FREE_EVERY === 0);
+  wakes++;
+  if (free) lastFreeWakeAt = Date.now();
+  const text = buildWakePrompt({
+    now, idleUserMin, channel, free,
+    sinceSpokeMin: lastSpokeAt ? (Date.now() - lastSpokeAt) / 60000 : undefined,
+    activities: free ? wakeActivities(ALLOWED, WAKE_ACTIVITIES) : [],
+  });
   const sink = {
     text() {}, thinking() {},
     finish(_u, fullText) {
@@ -618,25 +654,26 @@ function wakeTurn(idleUserMin) {
       else if (BARK_KEY) barkPush(t).catch((e) => log("[bark-err]", e.message));
     },
   };
+  log("[wake]", free ? "free" : "light");
   enqueue({
-    kind: "wake",
-    text: `【系统·自主时间】现在北京时间 ${now},她已约 ${Math.round(idleUserMin)} 分钟没有消息${sinceSpoke}。这轮是留给你自己的:${speakLine}没什么想说的就只回【沉默】两个字,这轮只用来保持你的状态和记忆连续。`,
+    kind: "wake", text,
     images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
   });
 }
-function wakeTick(force) {
+function wakeTick(force, forceFree) {
   if (busy || queue.length) return;
   const idleTurnMin = (Date.now() - lastTurnAt) / 60000;
   if (!force && idleTurnMin < WAKE_IDLE_MIN) return;
   log("[wake] idle", Math.round(idleTurnMin), "min", force ? "(forced)" : "");
-  wakeTurn((Date.now() - lastUserAt) / 60000);
+  wakeTurn((Date.now() - lastUserAt) / 60000, forceFree);
 }
 setInterval(wakeTick, WAKE_CHECK_MIN * 60000);
-// 手动触发口(测试用):POST /hb?key=<SHIM_KEY>
+// 手动触发口(测试用):POST /hb?key=<SHIM_KEY>[&free=1 强制给宽版提示]
 app.post("/hb", (req, res) => {
   if (SHIM_KEY && (req.query.key || req.get("x-api-key")) !== SHIM_KEY) return res.status(401).json({ ok: false });
-  wakeTick(true);
-  res.json({ ok: true, triggered: true });
+  const free = req.query.free === "1";
+  wakeTick(true, free);
+  res.json({ ok: true, triggered: true, free });
 });
 
 // ---- 音色热更新:换音色/调参数不用重启(= 不换窗口) --------------------------
