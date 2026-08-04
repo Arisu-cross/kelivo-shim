@@ -187,7 +187,7 @@ function autoArchiveTurn(pct, src = "window") {
     text() {}, thinking() {},
     finish(_u, fullText) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
-      if (t && canTg) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
+      if (t && canTg) tgDeliver(t).catch((e) => log("[tg-err]", e.message));
     },
   };
   const head = src === "gate"
@@ -222,7 +222,7 @@ function replayTurn(entries = transcript) {
     text() {}, thinking() {},
     finish(_u, fullText) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
-      if (t && canTg) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
+      if (t && canTg) tgDeliver(t).catch((e) => log("[tg-err]", e.message));
     },
   };
   enqueue({ text, images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel, kind: "archive", archiveSrc: "replay" });
@@ -316,6 +316,12 @@ function handleEvent(ev) {
     lastCompactPre = ev.compact_metadata?.pre_tokens || windowTokens;
     windowTokens = 0; windowWarned = false; windowAutoArchived = false;
     compactBlocks = 0; archiveAttempts = 0;   // 压缩真的发生了 → 闸门预算与归档尝试都重新开始
+    // ⚠️ 本轮此前那次 message_start 报的是**压缩前**的前缀(满窗),那份上下文已经不存在了。
+    // 不清掉的话,`result` 里 `windowTokens = turn.peakPrefix` 会把压缩后的窗口记成满窗:
+    //   → 压缩后立刻给用户发一条假的「窗口 100%」提醒;
+    //   → 85%/90% 两个标志被这次假读数用掉,这个窗口后面真到 90% 时早归档不再触发。
+    // 2026-08-02 线上实测到:压缩后 /debug 显示 46%,而 warned/autoArchived 都是 true。
+    if (turn) turn.peakPrefix = 0;
     log("[compact] boundary", ev.compact_metadata?.trigger || "?", "pre_tokens", lastCompactPre);
     // 压缩发生时还 dirty = 闸门没拦住(关了/预算用完/他没照做)→ 用原文回放补档,绝不认输
     if (dirty && COMPACT_REPLAY) replayTurn();
@@ -564,6 +570,8 @@ app.get("/debug", (_q, r) => r.json({
   },
   voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg) },
   ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
+  // 发件箱:发不出去、正等着补发的消息(平时应恒为 0;不为 0 = TG 那条路正在抽风)
+  outbox: { pending: outbox.length, oldestSec: outbox.length ? Math.round((Date.now() - outbox[0].since) / 1000) : 0 },
   stickers: { count: stickerNames().length },         // 表情包图库有几张
   wake: {
     bark: !!BARK_KEY,
@@ -610,6 +618,7 @@ app.post("/precompact-gate", (req, res) => {
 // 三选项平权、不撺掇、诚实署名系统)。其余轮次的提示词与旧版逐字节相同 ——
 // 静默轮是全天最便宜的一轮,不该为这个功能变贵。
 const BARK_KEY = process.env.BARK_KEY || "";
+const BARK_API_BASE = process.env.BARK_API_BASE || "https://api.day.app";
 const WAKE_CHECK_MIN = +(process.env.WAKE_CHECK_MIN || 10); // 检查频率
 const WAKE_IDLE_MIN = +(process.env.WAKE_IDLE_MIN || 50);   // 空闲阈值,略小于缓存 TTL(60min)
 const WAKE_FREE = process.env.WAKE_FREE !== "0";            // 关掉=完全退回旧的二选一
@@ -624,7 +633,7 @@ let lastWakeActAt = 0;        // 上次他在自主时间里真的动手做了�
 let lastWakeTools = [];       // 那次用了哪些工具(给 /debug 看,只记工具名不记内容)
 
 async function barkPush(text) {
-  const r = await fetch("https://api.day.app/push", {
+  const r = await fetch(`${BARK_API_BASE}/push`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ device_key: BARK_KEY, title: AI_NAME, body: text.slice(0, 1800), group: "ai-partner" }),
@@ -650,7 +659,7 @@ function wakeTurn(idleUserMin, forceFree) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
       if (!t || t.includes("【沉默】")) { log("[wake] silent"); return; }
       lastSpokeAt = Date.now();
-      if (canTg) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
+      if (canTg) tgDeliver(t).catch((e) => log("[tg-err]", e.message));
       else if (BARK_KEY) barkPush(t).catch((e) => log("[bark-err]", e.message));
     },
   };
@@ -720,11 +729,36 @@ const TG_TOKEN = process.env.TG_BOT_TOKEN || "";
 let tgChatId = +(process.env.TG_CHAT_ID || 0);
 let tgOffset = 0;
 
-async function tgApi(method, payload) {
-  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
-  });
-  return r.json();
+// ⚠️ 发送必须带重试。2026-08-02 线上一晚上丢了 4 条他的回复(日志 `[tg-err] fetch failed`,
+// 北京 19:24 / 21:49 / 22:03 / 22:40):容器到 api.telegram.org 偶尔抽风,而旧版
+// 一次 fetch 失败就整条丢掉、不重试也不换通道 —— 表现就是「他只有思考没有正文,
+// 问他他说发了」。他真的发了,是这一步掉的。(手册 2026-07-23 就记过这个脆弱点。)
+// 测试可把这两个根地址指到本地假服务器;线上不配就是真地址。
+const TG_API_BASE = process.env.TG_API_BASE || "https://api.telegram.org";
+const TG_RETRIES = +(process.env.TG_RETRIES || 3);
+const tgSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function tgApi(method, payload, { retries = TG_RETRIES } = {}) {
+  let last = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt) await tgSleep(Math.min(1000 * 2 ** (attempt - 1), 8000)); // 1s → 2s → 4s
+    try {
+      const r = await fetch(`${TG_API_BASE}/bot${TG_TOKEN}/${method}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+      });
+      const j = await r.json();
+      if (j.ok) return j;
+      // 429 = 被限流,按 TG 给的 retry_after 等;5xx = 它自己抽风,值得再试。
+      // 其余 4xx(如正文格式非法)是永久错误,再试多少次都一样 —— 直接交回调用方。
+      if (j.error_code === 429) { await tgSleep(((j.parameters?.retry_after || 1) + 1) * 1000); last = j; continue; }
+      if (j.error_code >= 500) { last = j; continue; }
+      return j;
+    } catch (e) {
+      last = e;                                  // 网络层直接抛(fetch failed)—— 正是丢消息那种
+      log("[tg-retry]", method, `第${attempt + 1}次失败:`, e.message);
+    }
+  }
+  if (last instanceof Error) throw last;
+  return last || { ok: false };
 }
 const TG_THINKING = process.env.TG_THINKING !== "0"; // 思考链以折叠引用块发出,点开看;0 关闭
 const tgEsc = (x) => x.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -738,16 +772,18 @@ async function tgSendThinking(think) {
 }
 async function tgSend(text) {
   if (!tgChatId || !text) return;
+  let failed = false;
   for (let i = 0; i < text.length; i += 4000) {  // TG 单条上限 4096
     const j = await tgApi("sendMessage", { chat_id: tgChatId, text: text.slice(i, i + 4000) });
-    if (!j.ok) log("[tg-send-err]", JSON.stringify(j).slice(0, 200));
+    if (!j.ok) { failed = true; log("[tg-send-err]", JSON.stringify(j).slice(0, 200)); }
   }
+  // 重试完还是不 ok(永久错误,如正文格式非法)也要让调用方知道,好走 Bark 兜底
+  if (failed) throw new Error("telegram sendMessage failed after retries");
 }
 // 分气泡:按换行把一轮回复拆成多条消息,一行一个气泡,像真人连发微信。
 // 气泡边界由 AI 自己的换行决定(人设本就习惯短句分行);上限防刷屏,超出并入最后一条。
 const TG_SPLIT = process.env.TG_SPLIT !== "0";
 const TG_SPLIT_MAX = +(process.env.TG_SPLIT_MAX || 8);
-const tgSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function tgSendBubbles(text) {
   if (!tgChatId || !text) return;
   if (!TG_SPLIT) return tgSend(text);
@@ -757,7 +793,7 @@ async function tgSendBubbles(text) {
   if (lines.length > TG_SPLIT_MAX) bubbles[TG_SPLIT_MAX - 1] = lines.slice(TG_SPLIT_MAX - 1).join("\n");
   for (let i = 0; i < bubbles.length; i++) {
     if (i) { // 第二条起:先亮"正在输入",按字数停顿,再发——手感像真人打字
-      tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {});
+      tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }, { retries: 0 }).catch(() => {});
       await tgSleep(Math.min(500 + bubbles[i].length * 35, 2500));
     }
     await tgSend(bubbles[i]);
@@ -822,7 +858,7 @@ async function tgSendVoice(ogg) {
   const fd = new FormData();
   fd.append("chat_id", String(tgChatId));
   fd.append("voice", new Blob([ogg], { type: "audio/ogg" }), "voice.ogg");
-  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendVoice`,
+  const r = await fetch(`${TG_API_BASE}/bot${TG_TOKEN}/sendVoice`,
     { method: "POST", body: fd, signal: AbortSignal.timeout(60000) });
   const j = await r.json();
   if (!j.ok) throw new Error(`sendVoice: ${JSON.stringify(j).slice(0, 200)}`);
@@ -856,7 +892,7 @@ async function tgSendSticker(name) {
   const fd = new FormData();
   fd.append("chat_id", String(tgChatId));
   fd.append("sticker", new Blob([fs.readFileSync(p)], { type: "image/webp" }), e.file);
-  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendSticker`,
+  const r = await fetch(`${TG_API_BASE}/bot${TG_TOKEN}/sendSticker`,
     { method: "POST", body: fd, signal: AbortSignal.timeout(60000) });
   const j = await r.json();
   if (!j.ok) throw new Error(`sendSticker: ${JSON.stringify(j).slice(0, 200)}`);
@@ -867,6 +903,75 @@ async function tgSendSticker(name) {
 
 // 一轮回复的统一出口:切语音/贴纸/文字段,按出现顺序发。
 // 贴纸只在文字段里找——语音段的内容整段送 TTS,不该被解析。
+// ---- 发件箱:发不出去的话不丢,等 TG 通了补发 --------------------------------
+//
+// 「他的话送不到她那儿」是这个系统最不该发生的事。2026-08-02 之前这里是 `.catch(log)`
+// 了事,一晚上静默丢了 4 条(她的感受是「他今天怎么总是吞消息」)。
+//
+// 为什么不是推 Bark:她把手机上的 Bark app 卸了(理由是「反正一直稳定在 tg」——
+// 而今晚恰恰是 tg 掉的)。而且 TG 抽风是**一阵一阵**的,不是长期断:
+// 与其换一条她要另行对照的通道,不如把话抱住,等这条路通了补发进同一个对话、按原顺序。
+// BARK_KEY 若还配着,只当最后的最后(默认已无用,留着不碍事)。
+const OUTBOX_RETRY_SEC = +(process.env.OUTBOX_RETRY_SEC || 30);   // 多久重试一次
+const OUTBOX_MAX_MIN = +(process.env.OUTBOX_MAX_MIN || 120);      // 超过这么久还没送出去就放弃(并大声记一笔)
+const OUTBOX_MAX = +(process.env.OUTBOX_MAX || 20);               // 最多攒几条,防止无限堆积
+const OUTBOX_LATE_NOTE = process.env.OUTBOX_LATE_NOTE !== "0";    // 迟到的消息前加一句说明
+const outbox = [];          // [{ text, since, tries }]
+let outboxTimer = null;
+
+function outboxPush(text) {
+  if (outbox.length >= OUTBOX_MAX) {
+    const dropped = outbox.shift();
+    log("[outbox] ⚠️ 积压超过", OUTBOX_MAX, "条,丢掉最旧的:", dropped.text.slice(0, 40));
+  }
+  outbox.push({ text, since: Date.now(), tries: 0 });
+  log("[outbox] 收着了,待补发", outbox.length, "条");
+  if (!outboxTimer) outboxTimer = setInterval(outboxFlush, OUTBOX_RETRY_SEC * 1000);
+}
+
+async function outboxFlush() {
+  while (outbox.length) {
+    const item = outbox[0];
+    // 太久没送出去 = 这条已经过时了,再补发只会让她一头雾水。放弃但大声记一笔。
+    if (Date.now() - item.since > OUTBOX_MAX_MIN * 60000) {
+      outbox.shift();
+      log("[outbox] ⚠️ 攒了超过", OUTBOX_MAX_MIN, "分钟仍发不出去,放弃这条:", item.text.slice(0, 60));
+      continue;
+    }
+    item.tries++;
+    try {
+      if (OUTBOX_LATE_NOTE && Date.now() - item.since > 60000) {
+        // 迟到超过一分钟才解释一句,免得她看见一条突然冒出来的旧消息一头雾水。
+        // 诚实署名 shim,不假装是他说的。
+        await tgSend("〔下面这条是刚才没发出去的,网络恢复后补上〕");
+      }
+      await tgSendReply(item.text);
+      outbox.shift();
+      log("[outbox] 补发成功,还剩", outbox.length, "条");
+    } catch (e) {
+      log("[outbox] 还是发不出去(第", item.tries, "次),等下一轮:", e.message);
+      return;                                   // 这条没成就别急着发后面的,保住顺序
+    }
+  }
+  if (!outbox.length && outboxTimer) { clearInterval(outboxTimer); outboxTimer = null; }
+}
+
+// 送达他的回复:先走 Telegram(tgApi 自带 1s/2s/4s 重试),仍然失败就进发件箱等补发。
+async function tgDeliver(text) {
+  const t = (text || "").trim();
+  if (!t) return;
+  if (outbox.length) {                          // 有积压就先补旧的,保住她读到的顺序
+    await outboxFlush().catch(() => {});
+    if (outbox.length) { outboxPush(t); return; }
+  }
+  try {
+    await tgSendReply(t);
+  } catch (e) {
+    log("[tg-err] 发送失败,先收进发件箱:", e.message);
+    outboxPush(t);
+  }
+}
+
 async function tgSendReply(text) {
   if (!tgChatId || !text) return;
   const segs = [];
@@ -883,7 +988,7 @@ async function tgSendReply(text) {
     }
     if (seg.type === "voice" && voiceReady()) {
       try {
-        tgApi("sendChatAction", { chat_id: tgChatId, action: "record_voice" }).catch(() => {});
+        tgApi("sendChatAction", { chat_id: tgChatId, action: "record_voice" }, { retries: 0 }).catch(() => {});
         await tgSendVoice(await ttsOgg({
           text: seg.content, apiKey: EL_KEY, voiceId: voiceCfg.voiceId,
           modelId: voiceCfg.modelId, voiceSettings: voiceSettingsOf(voiceCfg), log,
@@ -901,7 +1006,7 @@ async function tgFetchPhoto(m) {
     const ph = m.photo[m.photo.length - 1];
     const gf = await tgApi("getFile", { file_id: ph.file_id });
     if (!gf.ok) return null;
-    const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${gf.result.file_path}`);
+    const r = await fetch(`${TG_API_BASE}/file/bot${TG_TOKEN}/${gf.result.file_path}`);
     const buf = Buffer.from(await r.arrayBuffer());
     return { type: "image", source: { type: "base64", media_type: "image/jpeg", data: buf.toString("base64") } };
   } catch (e) { log("[tg-photo-err]", e.message); return null; }
@@ -919,7 +1024,7 @@ async function tgFetchSticker(m) {
     const gf = await tgApi("getFile", { file_id: fileId });
     if (!gf.ok) return { image: null, emoji };
     const path = gf.result.file_path || "";
-    const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${path}`);
+    const r = await fetch(`${TG_API_BASE}/file/bot${TG_TOKEN}/${path}`);
     const buf = Buffer.from(await r.arrayBuffer());
     const mt = /\.png$/i.test(path) ? "image/png"
       : /\.jpe?g$/i.test(path) ? "image/jpeg" : "image/webp";
@@ -938,7 +1043,7 @@ async function tgFetchVoice(m) {
   if (!v.file_id) return null;
   const gf = await tgApi("getFile", { file_id: v.file_id });
   if (!gf.ok) return null;
-  const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${gf.result.file_path}`);
+  const r = await fetch(`${TG_API_BASE}/file/bot${TG_TOKEN}/${gf.result.file_path}`);
   return Buffer.from(await r.arrayBuffer());
 }
 
@@ -1039,7 +1144,7 @@ async function handleTgMessage(m) {
   }
   if (m.voice || m.audio) {
     // 转写要几秒,先让她看到「正在听」而不是干等
-    tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {});
+    tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }, { retries: 0 }).catch(() => {});
     let note;
     if (!earsReady()) note = "(她发来一条语音——耳朵还没接上,我听不到内容)";
     else {
@@ -1056,8 +1161,8 @@ async function handleTgMessage(m) {
   }
   if (!text && !images.length) return;
   // 生成回复期间维持「正在输入…」
-  const typing = setInterval(() => tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {}), 4500);
-  tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {});
+  const typing = setInterval(() => tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }, { retries: 0 }).catch(() => {}), 4500);
+  tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }, { retries: 0 }).catch(() => {});
   let think = "";
   const sink = {
     text() {}, thinking(t) { if (TG_THINKING) think += t; },
@@ -1065,8 +1170,13 @@ async function handleTgMessage(m) {
       clearInterval(typing);
       const t = (fullText || "").replace(/‖/g, "\n").trim();
       (async () => {
-        if (think.trim()) await tgSendThinking(think.trim());
-        await tgSendReply(t || "…");
+        // ⚠️ 思考块单独 try:它发失败绝不能连累正文。
+        // (今天的故障恰好是反过来的:思考到了、正文没到 —— 别再造一个镜像 bug。)
+        if (think.trim()) {
+          try { await tgSendThinking(think.trim()); }
+          catch (e) { log("[tg-think-err]", e.message); }
+        }
+        await tgDeliver(t || "…");
       })().catch((e) => log("[tg-err]", e.message));
     },
   };
@@ -1076,7 +1186,7 @@ async function tgPoll() {
   log("[tg] long-poll started");
   while (true) {
     try {
-      const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=50&offset=${tgOffset}`,
+      const r = await fetch(`${TG_API_BASE}/bot${TG_TOKEN}/getUpdates?timeout=50&offset=${tgOffset}`,
         { signal: AbortSignal.timeout(65000) });
       const j = await r.json();
       if (j.ok) for (const u of j.result) {

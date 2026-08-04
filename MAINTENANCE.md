@@ -63,6 +63,15 @@
   查状态:`/debug.gate` 的 `{dirty, blocks, lastArchiveAt, replayPending, bufferedChars}`。
   ⚠️ 这依赖 CLI 的钩子契约,**升级 CLI 要重测**:契约变了不报错,只会安静失效。
 
+- **他的话必须送到(发送重试 + 发件箱)**:容器到 `api.telegram.org` 会偶发
+  `fetch failed`(2026-08-02 一晚上四次),旧代码一次失败就整条丢、不重试不告警 ——
+  表现是「只有 thinking 没有正文,问他他说发了」。现在:`tgApi` 对网络错误与 5xx
+  退避重试(1s/2s/4s),429 按 `retry_after` 等;仍失败则进**发件箱**
+  (`OUTBOX_RETRY_SEC` 默认 30 秒重试一次,`OUTBOX_MAX_MIN` 默认 120 分钟后放弃),
+  TG 一恢复就按原顺序补发,迟到超过一分钟会先说明一句(诚实署名 shim,不假装是他说的)。
+  思考块单独 try —— 它发失败绝不能连累正文。`/debug.outbox.pending` 平时恒为 0,
+  不为 0 就是这条路正在抽风。⚠️ Bark 只是历史遗留的最后手段,**别再当兜底依赖**。
+
 ## 工作规范
 
 - 改动走开发分支,不直推 main;commit 说清「改了什么、为什么」。
