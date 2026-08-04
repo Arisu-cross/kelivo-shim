@@ -53,6 +53,18 @@ function reply(text) {
     return;
   }
 
+  // FAKE_API_FAIL=1:重演 2026-08-04 的授权故障 —— CLI 一个字都不说,
+  // 却把这一轮标成 subtype:"success",真话只写在 is_error/api_error_status/result 里。
+  if (process.env.FAKE_API_FAIL === "1") {
+    out({
+      type: "result", subtype: "success", is_error: true, terminal_reason: "api_error",
+      api_error_status: 503, duration_ms: 174095,
+      result: "API Error: 503 auth_unavailable: no auth available (providers=claude, model=claude-opus-5)",
+      usage: { input_tokens: 0, output_tokens: 0 },
+    });
+    return;
+  }
+
   const wantArchive = text.includes("archive_session");
   const wantFail = text.includes("ARCHIVE_FAIL");
   if (wantArchive || wantFail) {

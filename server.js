@@ -17,6 +17,7 @@ import { splitVoiceSegments, ttsOgg } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
 import { prefixFromMessageStart, windowPct, DEFAULT_WINDOW_LIMIT } from "./window.js";
 import { buildWakePrompt, wakeActivities } from "./wake.js";
+import { resultFailure, failureReply, outageNotice, recoveryNotice } from "./api-health.js";
 import {
   gateDecision, GATE_REASON, trimTranscript, renderReplay,
   DEFAULT_MAX_BLOCKS, DEFAULT_REPLAY_MAX_CHARS,
@@ -109,6 +110,14 @@ let lastCompactPre = 0;      // 上次压缩前的窗口大小(CLI 给的 pre_to
 // ---- 闸门状态 ----
 // dirty = 自上次**成功**归档(tool_result 带 🗄️)以来又聊过了。闸门只在 dirty 时拦压缩。
 let dirty = false;
+// ---- 模型可达性(2026-08-04 事故之后新增)----
+// 那次故障之所以能藏一整晚,就是因为**没有任何一处会因为它出声**。这几个变量存在的
+// 唯一目的就是让下一次故障立刻可见:日志里有、/debug 里有、她手机上也有(只吵一次)。
+const API_FAIL_NOTIFY_AT = +(process.env.API_FAIL_NOTIFY_AT || 1); // 连续失败几轮就通知她
+let apiFails = 0;             // 当前连续失败轮数(成功一轮即归零)
+let apiOutageNotified = false;// 本次故障是否已经通知过(防刷屏)
+let apiOutageSince = 0;       // 本次故障起点
+let lastApiFailAt = 0, lastApiFailWhy = "", lastApiOkAt = 0;
 let lastArchiveAt = null;    // 上次成功归档的时刻
 let compactBlocks = 0;       // 本窗口拦过几次压缩(压缩真的发生 / 换窗后清零)
 let archiveAttempts = 0;     // 当前这轮「请他归档」试了几次(成功或换窗后清零)
@@ -408,9 +417,31 @@ function handleEvent(ev) {
     // 不跨轮取 max —— 数值本身已经准确,跨轮钉死只会让某次异常永远修不回来
     // (上一版正是因为 Math.max + 顶层累加值,一次虚报就把 32% 永久显示成 97%)。
     if (turn.peakPrefix > 0) { windowTokens = turn.peakPrefix; checkWindowUsage(); }
-    if (ev.subtype && ev.subtype !== "success") {
-      log("[result-error]", ev.subtype);
-      if (!turn.fullText) turn.sse?.text(`⚠️[shim] ${ev.subtype}`);
+    // 失败识别:**不能只看 subtype** —— 2026-08-04 事故里 CLI 把一场 503 授权故障
+    // 标成了 subtype:"success",真话只写在 is_error/api_error_status/result 里。详见 api-health.js。
+    const fail = resultFailure(ev);
+    if (fail) {
+      apiFails++; lastApiFailAt = Date.now(); lastApiFailWhy = fail.why;
+      log("[result-error]", `subtype=${fail.subtype || "-"}`, `status=${fail.status || "-"}`,
+        `reason=${fail.reason || "-"}`, "|", fail.why);
+      // 空回复的那一轮:她该看见「没送到」,不是一个什么都没说的「…」。
+      // 只替换她主动说话的那一轮 —— 自主时间失败了就安静失败,别半夜往她手机上弹错误。
+      if (!turn.fullText && turn.kind === "user") {
+        turn.errText = failureReply(fail);
+        turn.sse?.text(turn.errText);   // 流式客户端(Kelivo)走这条;TG 走下面的 finish 参数
+      }
+      if (turn.kind === "wake") log("[wake] 这轮是失败,不是他选择沉默");
+      // 一次故障只吵一条(首次失败即告警 —— 这次就是没人吱声才拖了一整晚)
+      if (apiFails === API_FAIL_NOTIFY_AT && !apiOutageNotified) {
+        apiOutageNotified = true; apiOutageSince = lastApiFailAt;
+        tgSend(outageNotice(fail)).catch((e) => log("[tg-err]", e.message));
+      }
+    } else {
+      if (apiOutageNotified) {
+        tgSend(recoveryNotice(apiFails, Date.now() - apiOutageSince)).catch((e) => log("[tg-err]", e.message));
+        apiOutageNotified = false;
+      }
+      apiFails = 0; lastApiOkAt = Date.now();
     }
     const wantSwitch = turn.newWindow;
     const archivedOk = turn.archiveOk;
@@ -449,7 +480,9 @@ function handleEvent(ev) {
     const usage = ev.usage ? { output_tokens: ev.usage.output_tokens } : undefined;
     const doKill = wantSwitch && archivedOk && proc;
     turn.done = true;
-    turn.sse?.finish(usage, turn.fullText);
+    // errText 只在他一个字都没说、且是她主动说话的那一轮才有值(见上面的失败分支)。
+    // 不并进 fullText —— 那样会被当成「他说过话」记进补档缓冲、还会把闸门拉脏。
+    turn.sse?.finish(usage, turn.fullText || turn.errText || "");
     turn = null;
     busy = false;
     if (doKill) { log("[window] archived ok, restarting proc"); try { proc.kill(); } catch {} proc = null; }
@@ -479,7 +512,7 @@ function pump() {
 
   turn = {
     sse: item.sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {}, archiveOk: false, peakPrefix: 0,
-    kind: item.kind || "user", archiveSrc: item.archiveSrc, tools: [],
+    kind: item.kind || "user", archiveSrc: item.archiveSrc, tools: [], errText: "",
   };
   // 原文留存(压缩溜过去时的补档素材)。系统注入的轮次(自主时间/归档请求/回放)不记 ——
   // 它们不是他们俩说的话,记了只会挤掉真正该留的内容。
@@ -567,6 +600,13 @@ app.get("/debug", (_q, r) => r.json({
     lastArchiveAt: lastArchiveAt ? new Date(lastArchiveAt).toISOString() : null,
     archiveAttempts, replay: COMPACT_REPLAY, replayPending,
     bufferedChars: transcript.reduce((n, e) => n + e.text.length, 0), // 只报字数,不报内容
+  },
+  // 模型这条线通不通(排查「他怎么不说话了」先看这里:fails>0 就不是他的问题)
+  api: {
+    fails: apiFails, notified: apiOutageNotified, notifyAt: API_FAIL_NOTIFY_AT,
+    lastOkAt: lastApiOkAt ? new Date(lastApiOkAt).toISOString() : null,
+    lastFailAt: lastApiFailAt ? new Date(lastApiFailAt).toISOString() : null,
+    lastFailWhy: lastApiFailWhy || null,
   },
   voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg) },
   ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
