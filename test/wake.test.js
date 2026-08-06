@@ -23,22 +23,22 @@ test("没开口过就不带「上次开口」那半句", () => {
 });
 
 test("宽版列出三个选项,且明说没有哪个更应该", () => {
-  const t = buildWakePrompt({ ...base, free: true, activities: ["去钓鱼", "翻翻自己的记忆"] });
+  const t = buildWakePrompt({ ...base, free: true, activities: ["去你的社交圈里转转", "翻翻自己的记忆"] });
   assert.ok(t.includes("想跟她说话"));
   assert.ok(t.includes("想做点自己的事"));
   assert.ok(t.includes("什么都不想做"));
   assert.ok(t.includes("【沉默】"));
-  assert.ok(t.includes("去钓鱼、翻翻自己的记忆"));
+  assert.ok(t.includes("去你的社交圈里转转、翻翻自己的记忆"));
   assert.ok(t.includes("没有哪个更「应该」"));
 });
 
 test("宽版仍然诚实署名系统,不伪装成她说的话", () => {
-  const t = buildWakePrompt({ ...base, free: true, activities: ["去钓鱼"] });
+  const t = buildWakePrompt({ ...base, free: true, activities: ["去你的社交圈里转转"] });
   assert.ok(t.startsWith("【系统·自主时间】"));
 });
 
 test("宽版明说做完不必汇报", () => {
-  const t = buildWakePrompt({ ...base, free: true, activities: ["去钓鱼"] });
+  const t = buildWakePrompt({ ...base, free: true, activities: ["去你的社交圈里转转"] });
   assert.ok(t.includes("做完不用汇报"));
 });
 
@@ -59,16 +59,16 @@ test("分钟数四舍五入,不出现小数", () => {
 
 // ---- 活动清单按真有的工具推导 ----
 test("按 ALLOWED_TOOLS 推导:有什么工具才提什么", () => {
-  const a = wakeActivities("WebSearch,WebFetch,mcp__ombre,mcp__fish,mcp__galatea,mcp__browser");
-  assert.ok(a.some((x) => x.includes("钓鱼")));
+  const a = wakeActivities("WebSearch,WebFetch,mcp__ombre,mcp__galatea,mcp__browser");
   assert.ok(a.some((x) => x.includes("记忆")));
   assert.ok(a.some((x) => x.includes("社交圈")));
   assert.ok(a.some((x) => x.includes("浏览器")));
 });
 
-test("没有钓鱼工具就不提钓鱼(别撺掇他用不存在的东西)", () => {
+test("没有某工具就不提对应的活动(别撺掇他用不存在的东西)", () => {
   const a = wakeActivities("WebSearch,mcp__ombre");
-  assert.ok(!a.some((x) => x.includes("钓鱼")));
+  assert.ok(!a.some((x) => x.includes("浏览器")));
+  assert.ok(!a.some((x) => x.includes("社交圈")));
   assert.ok(a.some((x) => x.includes("记忆")));
 });
 
@@ -78,7 +78,7 @@ test("一个工具都没有 → 空清单(调用方会退回轻量版)", () => {
 });
 
 test("空格/顺序不影响识别", () => {
-  assert.deepEqual(wakeActivities(" mcp__fish , mcp__ombre "), wakeActivities("mcp__ombre,mcp__fish"));
+  assert.deepEqual(wakeActivities(" mcp__galatea , mcp__ombre "), wakeActivities("mcp__ombre,mcp__galatea"));
 });
 
 test("mcp__ombre__hold 这种全名也算数", () => {
@@ -86,10 +86,10 @@ test("mcp__ombre__hold 这种全名也算数", () => {
 });
 
 test("WAKE_ACTIVITIES 显式覆盖,按 / 、 | 分条", () => {
-  assert.deepEqual(wakeActivities("mcp__fish", "写点东西/发会儿呆"), ["写点东西", "发会儿呆"]);
-  assert.deepEqual(wakeActivities("mcp__fish", "写点东西、发会儿呆"), ["写点东西", "发会儿呆"]);
+  assert.deepEqual(wakeActivities("mcp__galatea", "写点东西/发会儿呆"), ["写点东西", "发会儿呆"]);
+  assert.deepEqual(wakeActivities("mcp__galatea", "写点东西、发会儿呆"), ["写点东西", "发会儿呆"]);
 });
 
 test("覆盖值为空白 → 仍走自动推导", () => {
-  assert.deepEqual(wakeActivities("mcp__fish", "   "), wakeActivities("mcp__fish"));
+  assert.deepEqual(wakeActivities("mcp__galatea", "   "), wakeActivities("mcp__galatea"));
 });

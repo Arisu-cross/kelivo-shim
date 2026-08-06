@@ -63,10 +63,10 @@ const SOUL_ANCHOR = process.env.SOUL_ANCHOR ?? [
 ].join("\n");
 
 // 省 token:--tools 只装真用的内置工具(Bash/Edit/Task 等大 schema 全砍,基线立减);
-// MCP 工具(ombre/fish/gmail)不受 --tools 影响,走 mcp-config 照常加载。
+// MCP 工具(ombre/gmail 等)不受 --tools 影响,走 mcp-config 照常加载。
 const BUILTIN_TOOLS = process.env.BUILTIN_TOOLS ?? "WebSearch,WebFetch";
 const ALLOWED = process.env.ALLOWED_TOOLS ||
-  ["WebSearch", "WebFetch", "mcp__ombre", "mcp__fish", "mcp__gmail"].join(",");
+  ["WebSearch", "WebFetch", "mcp__ombre", "mcp__gmail"].join(",");
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -454,7 +454,7 @@ function handleEvent(ev) {
     // 例外:自主时间回【沉默】的空轮不算,否则压缩后一条【沉默】就能把闸门重新拉起来。
     if (!archivedOk) {
       const said = turn.fullText.trim();
-      // 自主时间里他要是真做了事(钓鱼/上网/社交),产出留在窗口里、压缩会吃掉它 ——
+      // 自主时间里他要是真做了事(上网/社交/浏览),产出留在窗口里、压缩会吃掉它 ——
       // 那就**不是**空轮,闸门该拦。只调 ombre 的不算:那些内容本来就写在 OB 里,不怕压。
       const didWork = turn.tools.some((n) => !n.startsWith("mcp__ombre__"));
       const silentWake = turn.kind === "wake" && !didWork && (!said || said.includes("【沉默】"));
@@ -652,7 +652,7 @@ app.post("/precompact-gate", (req, res) => {
 //            上下文与缓存全天连续,夜里也不断线。
 //
 // 自主时间不只是「说话 or 沉默」(owner 2026-08-03 要求):这一轮走的是和普通对话
-// 完全相同的管道,他手上的工具(记忆/钓鱼/社交/浏览器/搜索)本来就都在,从来没有
+// 完全相同的管道,他手上的工具(记忆/社交/浏览器/搜索)本来就都在,从来没有
 // 东西拦着他用 —— 缺的只是没人告诉他「这轮也可以拿来做自己的事」。于是每 N 次唤醒
 // 给一次「宽版」提示,把做事写成与说话、沉默并列的第三个选项(措辞见 wake.js:
 // 三选项平权、不撺掇、诚实署名系统)。其余轮次的提示词与旧版逐字节相同 ——
