@@ -63,6 +63,30 @@
   查状态:`/debug.gate` 的 `{dirty, blocks, lastArchiveAt, replayPending, bufferedChars}`。
   ⚠️ 这依赖 CLI 的钩子契约,**升级 CLI 要重测**:契约变了不报错,只会安静失效。
 
+## ⚠️ `@anthropic-ai/claude-code` 必须钉死版本(别改回 `^`)
+
+`package.json` 里这一项**写死为精确版本,不带 `^`**。原因不是洁癖:
+
+- 依赖是在**构建时**装的。写 `^2.1.x` 意味着**每次重新构建都会装当时最新的 2.x**,
+  于是「同一份代码,昨天构建和今天构建跑的 CLI 不是同一个」。
+- 如果你的 `ANTHROPIC_BASE_URL` 指向的是**中转/网关**(把订阅包装成 API 的那类),
+  这类网关普遍会按**客户端版本指纹**(user-agent / package-version / runtime-version)
+  判断「这是不是原生 CLI」。**版本落在它测量过的基线之外时,它会把请求重建成自己的形状**
+  —— 客户端侧的开关就此失效,典型症状是:
+  **`ENABLE_PROMPT_CACHING_1H=1` 明明设了,`/debug` 里 `ephemeral_1h_input_tokens` 却恒为 0、
+  缓存全落进 5 分钟桶**,于是每轮唤醒都要全价重写整个前缀,账单显著变贵而功能"看着正常"。
+- 这类故障**没有任何报错**,只在用量里体现,极难联想到"上次重新构建过"。
+
+**症状自查**:打一条消息后看 `GET /debug` 的 `lastUsage.cache_creation`——
+`ephemeral_1h_input_tokens > 0` 才算 1 小时缓存真的生效;
+若它恒为 0 而 `ephemeral_5m_input_tokens` 有值,先查 CLI 版本有没有漂。
+
+**升级 CLI 时**:改这里的精确版本号 → 部署 → 按上面的方法确认 1h 缓存仍然生效,
+再确认压缩钩子契约没变(见上一节)。**两项都过了才算升级完成。**
+
+> 同类教训:任何"上游一发版就可能变行为"的关键依赖都要卡死版本,
+> 不要用 `^` / `>=` 之类的开区间。
+
 ## 工作规范
 
 - 改动走开发分支,不直推 main;commit 说清「改了什么、为什么」。
