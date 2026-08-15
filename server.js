@@ -16,6 +16,7 @@ import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
 import { prefixFromMessageStart, windowPct, DEFAULT_WINDOW_LIMIT } from "./window.js";
+import { tgEsc, chunkForHtml } from "./tg-chunk.js";
 import {
   gateDecision, GATE_REASON, trimTranscript, renderReplay,
   DEFAULT_MAX_BLOCKS, DEFAULT_REPLAY_MAX_CHARS,
@@ -690,14 +691,22 @@ async function tgApi(method, payload) {
   return r.json();
 }
 const TG_THINKING = process.env.TG_THINKING !== "0"; // 思考链以折叠引用块发出,点开看;0 关闭
-const tgEsc = (x) => x.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+// 可折叠引用块:默认收起一行,点开展开——等价于 Kelivo 的 reasoning 视图。
+// ⚠️ 这个函数**绝不允许抛错**:它的调用点排在正文之前,以前它一抛,后面那条正文
+//    就再也发不出去(2026-08-13 事故:他明明回了,她那边一片安静)。
+//    思考链丢了是小事,正文丢了是大事 —— 这里的每个错误都必须自己咽下去。
 async function tgSendThinking(think) {
   if (!tgChatId || !think) return;
-  // 可折叠引用块:默认收起一行,点开展开——等价于 Kelivo 的 reasoning 视图
-  const body = think.length > 3600 ? think.slice(0, 3600) + "…" : think;
-  const j = await tgApi("sendMessage", { chat_id: tgChatId, parse_mode: "HTML",
-    text: `<blockquote expandable>${tgEsc(body)}</blockquote>` });
-  if (!j.ok) log("[tg-think-err]", JSON.stringify(j).slice(0, 200));
+  try {
+    // 超长不再截断,分成多条发。切块按转义后的长度算,见 tg-chunk.js
+    for (const part of chunkForHtml(think)) {
+      const j = await tgApi("sendMessage", { chat_id: tgChatId, parse_mode: "HTML",
+        text: `<blockquote expandable>${tgEsc(part)}</blockquote>` });
+      if (!j.ok) log("[tg-think-err]", JSON.stringify(j).slice(0, 200));
+    }
+  } catch (e) {
+    log("[tg-think-err]", e.message);
+  }
 }
 async function tgSend(text) {
   if (!tgChatId || !text) return;
@@ -837,10 +846,11 @@ async function tgSendReply(text) {
     if (s.type === "text") segs.push(...splitStickerSegments(s.content, hasSticker));
     else segs.push(s);
   }
+  let delivered = 0;                       // 这一轮到底有没有东西真的到了她手机上
   for (const seg of segs) {
     if (!seg.content.trim()) continue;
     if (seg.type === "sticker") {
-      try { if (await tgSendSticker(seg.content)) continue; }
+      try { if (await tgSendSticker(seg.content)) { delivered++; continue; } }
       catch (e) { log("[sticker-err]", seg.content, e.message); }
       continue;                              // 发不出去就当没这张,不把标记吐给她看
     }
@@ -851,10 +861,19 @@ async function tgSendReply(text) {
           text: seg.content, apiKey: EL_KEY, voiceId: voiceCfg.voiceId,
           modelId: voiceCfg.modelId, voiceSettings: voiceSettingsOf(voiceCfg), log,
         }));
+        delivered++;
         continue;
       } catch (e) { log("[voice-err]", e.message); } // 落到下面的文字降级
     }
     await tgSendBubbles(seg.content);
+    delivered++;
+  }
+  // 兜底:一条都没送出去。典型情况是他这轮**只回了一张贴纸**而贴纸发失败了 ——
+  // 上面那个 continue 会把它默默丢掉,她那边就是一片安静,什么都看不到。
+  // 宁可把原文(带 [贴纸:x] 标记)发给她,也不能让他的回复凭空消失。
+  if (!delivered) {
+    log("[tg] nothing delivered — falling back to raw text");
+    await tgSendBubbles(text);
   }
 }
 
@@ -1028,8 +1047,9 @@ async function handleTgMessage(m) {
       clearInterval(typing);
       const t = (fullText || "").replace(/‖/g, "\n").trim();
       (async () => {
-        if (think.trim()) await tgSendThinking(think.trim());
-        await tgSendReply(t || "…");
+        // 两步各自兜底:思考链出任何问题都不许连累正文。正文是他对她说的话,优先保住。
+        if (think.trim()) await tgSendThinking(think.trim()).catch((e) => log("[tg-think-err]", e.message));
+        await tgSendReply(t || "…").catch((e) => log("[tg-err]", e.message));
       })().catch((e) => log("[tg-err]", e.message));
     },
   };
