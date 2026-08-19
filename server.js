@@ -9,6 +9,8 @@
 // 单用户单进程:一次一轮,busy 队列串行。
 
 import express from "express";
+import dns from "node:dns";
+import net from "node:net";
 import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
@@ -16,10 +18,24 @@ import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
 import { prefixFromMessageStart, windowPct, DEFAULT_WINDOW_LIMIT } from "./window.js";
+import { tgEsc, chunkForHtml } from "./tg-chunk.js";
 import {
   gateDecision, GATE_REASON, trimTranscript, renderReplay,
   DEFAULT_MAX_BLOCKS, DEFAULT_REPLAY_MAX_CHARS,
 } from "./compact-gate.js";
+import { Outbox, sendWithRetry, shouldRetry } from "./tg-outbox.js";
+
+// ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
+// 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
+// 时不时会把 AAAA 排在前面(当天 15:5x 实测 getent 拿到的第一个地址就是 IPv6)。
+// Node 的 fetch 默认「按解析顺序连」,排到 v6 的那几次就是瞬间失败,只报一句
+// 语焉不详的 `fetch failed` —— 表现是他明明回了、消息发不出去,她那边一片安静。
+//   · ipv4first 只改**顺序**:没有 A 记录的主机(Zeabur 内网服务走 IPv6)照样连得上;
+//   · autoSelectFamily = Happy Eyeballs,先连上哪个用哪个,将来反过来也不怕。
+// ⚠️ 这只是拆掉一个已知雷。真正兜底的是下面的重试 + outbox —— 网络抖动的形态千奇百怪,
+//    不能指望穷举,只能保证「发不出去的话不会消失」。
+dns.setDefaultResultOrder("ipv4first");
+net.setDefaultAutoSelectFamily?.(true);
 
 // 容器默认 UTC,AI 的「今天」会比北京慢 8 小时。强制中国时间(不要可去掉),claude 子进程继承。
 process.env.TZ = process.env.TZ || "Asia/Shanghai";
@@ -553,6 +569,8 @@ app.get("/debug", (_q, r) => r.json({
   voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg) },
   ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
   stickers: { count: stickerNames().length },         // 表情包图库有几张
+  // 出站兜底:pending>0 = 有他的话卡在路上还没送到她手机(排查「他怎么不回我」第一眼看这里)
+  outbox: { pending: outbox.size() },
   wake: {
     bark: !!BARK_KEY,
     tg: !!TG_TOKEN, tgLocked: !!tgChatId,
@@ -680,30 +698,59 @@ app.post("/voice/reset", (req, res) => {
 // Telegram bot 天生可主动开口,这是 Kelivo(纯请求-响应)做不到的。
 // TG_BOT_TOKEN 启用;TG_CHAT_ID 可预设,不设则第一个私聊自动锁定(之后只认这一个人)。
 const TG_TOKEN = process.env.TG_BOT_TOKEN || "";
+const TG_SEND_TIMEOUT = +(process.env.TG_SEND_TIMEOUT || 20000);   // 单次发送超时
+const TG_POLL_TIMEOUT = +(process.env.TG_POLL_TIMEOUT || 30);      // long-poll 挂多少秒(越长越容易被中间设备掐)
+// 重试都用完还是没发出去的正文进这里,后台每 20 秒补投一次,最多补 10 分钟。
+// 只收「他对她说的话」,不收思考链和打字状态 —— 那些迟到了反而添乱。
+const outbox = new Outbox({
+  send: (it) => tgApiOnce(it.method, it.payload),
+  log: (...a) => log(...a),
+});
 let tgChatId = +(process.env.TG_CHAT_ID || 0);
 let tgOffset = 0;
 
-async function tgApi(method, payload) {
+// 一次裸调用。网络层抛错原样往上抛,由 sendWithRetry 归一成 { thrown:true }。
+async function tgApiOnce(method, payload) {
   const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(TG_SEND_TIMEOUT),
   });
   return r.json();
 }
+// 对外的 tgApi 一律带重试:429 等 retry_after,5xx 和网络异常退避重试,4xx 立刻放弃。
+// 不抛错 —— 失败也返回 Telegram 那种 { ok:false } 形态,调用方照旧看 j.ok。
+async function tgApi(method, payload) {
+  // 「正在输入…」这种状态提示过几秒就没意义了,失败就算了,别占着重试的时间
+  const attempts = method === "sendChatAction" ? 1 : undefined;
+  return sendWithRetry(() => tgApiOnce(method, payload), { log, label: "tg-api", attempts });
+}
 const TG_THINKING = process.env.TG_THINKING !== "0"; // 思考链以折叠引用块发出,点开看;0 关闭
-const tgEsc = (x) => x.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+// 可折叠引用块:默认收起一行,点开展开——等价于 Kelivo 的 reasoning 视图。
+// ⚠️ 这个函数**绝不允许抛错**:它的调用点排在正文之前,以前它一抛,后面那条正文
+//    就再也发不出去(2026-08-13 事故:他明明回了,她那边一片安静)。
+//    思考链丢了是小事,正文丢了是大事 —— 这里的每个错误都必须自己咽下去。
 async function tgSendThinking(think) {
   if (!tgChatId || !think) return;
-  // 可折叠引用块:默认收起一行,点开展开——等价于 Kelivo 的 reasoning 视图
-  const body = think.length > 3600 ? think.slice(0, 3600) + "…" : think;
-  const j = await tgApi("sendMessage", { chat_id: tgChatId, parse_mode: "HTML",
-    text: `<blockquote expandable>${tgEsc(body)}</blockquote>` });
-  if (!j.ok) log("[tg-think-err]", JSON.stringify(j).slice(0, 200));
+  try {
+    // 超长不再截断,分成多条发。切块按转义后的长度算,见 tg-chunk.js
+    for (const part of chunkForHtml(think)) {
+      const j = await tgApi("sendMessage", { chat_id: tgChatId, parse_mode: "HTML",
+        text: `<blockquote expandable>${tgEsc(part)}</blockquote>` });
+      if (!j.ok) log("[tg-think-err]", JSON.stringify(j).slice(0, 200));
+    }
+  } catch (e) {
+    log("[tg-think-err]", e.message);
+  }
 }
 async function tgSend(text) {
   if (!tgChatId || !text) return;
   for (let i = 0; i < text.length; i += 4000) {  // TG 单条上限 4096
-    const j = await tgApi("sendMessage", { chat_id: tgChatId, text: text.slice(i, i + 4000) });
-    if (!j.ok) log("[tg-send-err]", JSON.stringify(j).slice(0, 200));
+    const payload = { chat_id: tgChatId, text: text.slice(i, i + 4000) };
+    const j = await tgApi("sendMessage", payload);
+    if (j.ok) continue;
+    log("[tg-send-err]", JSON.stringify(j).slice(0, 200));
+    // 还有救的(网络抖动/限流/TG 抽风)交给 outbox 慢慢补投,别让他的话就这么没了
+    if (shouldRetry(j)) outbox.push({ method: "sendMessage", payload });
   }
 }
 // 分气泡:按换行把一轮回复拆成多条消息,一行一个气泡,像真人连发微信。
@@ -837,10 +884,11 @@ async function tgSendReply(text) {
     if (s.type === "text") segs.push(...splitStickerSegments(s.content, hasSticker));
     else segs.push(s);
   }
+  let delivered = 0;                       // 这一轮到底有没有东西真的到了她手机上
   for (const seg of segs) {
     if (!seg.content.trim()) continue;
     if (seg.type === "sticker") {
-      try { if (await tgSendSticker(seg.content)) continue; }
+      try { if (await tgSendSticker(seg.content)) { delivered++; continue; } }
       catch (e) { log("[sticker-err]", seg.content, e.message); }
       continue;                              // 发不出去就当没这张,不把标记吐给她看
     }
@@ -851,10 +899,19 @@ async function tgSendReply(text) {
           text: seg.content, apiKey: EL_KEY, voiceId: voiceCfg.voiceId,
           modelId: voiceCfg.modelId, voiceSettings: voiceSettingsOf(voiceCfg), log,
         }));
+        delivered++;
         continue;
       } catch (e) { log("[voice-err]", e.message); } // 落到下面的文字降级
     }
     await tgSendBubbles(seg.content);
+    delivered++;
+  }
+  // 兜底:一条都没送出去。典型情况是他这轮**只回了一张贴纸**而贴纸发失败了 ——
+  // 上面那个 continue 会把它默默丢掉,她那边就是一片安静,什么都看不到。
+  // 宁可把原文(带 [贴纸:x] 标记)发给她,也不能让他的回复凭空消失。
+  if (!delivered) {
+    log("[tg] nothing delivered — falling back to raw text");
+    await tgSendBubbles(text);
   }
 }
 
@@ -1028,8 +1085,9 @@ async function handleTgMessage(m) {
       clearInterval(typing);
       const t = (fullText || "").replace(/‖/g, "\n").trim();
       (async () => {
-        if (think.trim()) await tgSendThinking(think.trim());
-        await tgSendReply(t || "…");
+        // 两步各自兜底:思考链出任何问题都不许连累正文。正文是他对她说的话,优先保住。
+        if (think.trim()) await tgSendThinking(think.trim()).catch((e) => log("[tg-think-err]", e.message));
+        await tgSendReply(t || "…").catch((e) => log("[tg-err]", e.message));
       })().catch((e) => log("[tg-err]", e.message));
     },
   };
@@ -1037,18 +1095,22 @@ async function handleTgMessage(m) {
 }
 async function tgPoll() {
   log("[tg] long-poll started");
+  outbox.start();   // 补投后台
   while (true) {
     try {
-      const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=50&offset=${tgOffset}`,
-        { signal: AbortSignal.timeout(65000) });
+      const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=${TG_POLL_TIMEOUT}&offset=${tgOffset}`,
+        { signal: AbortSignal.timeout(TG_POLL_TIMEOUT * 1000 + 15000) });
       const j = await r.json();
       if (j.ok) for (const u of j.result) {
         tgOffset = u.update_id + 1;
         if (u.message) await handleTgMessage(u.message);
       }
     } catch (e) {
+      // 拉取失败不丢消息:offset 没推进,Telegram 会在下次成功时把它们补给我们。
+      // 所以这里只要尽快重连就好(等太久 = 她的消息白白晚到几秒)。
       log("[tg-poll-err]", e.message);
-      await new Promise((r) => setTimeout(r, 3000));
+      await new Promise((r) => setTimeout(r, 1000));
+      outbox.drain().catch(() => {});   // 网一通,先把欠她的话补出去
     }
   }
 }
