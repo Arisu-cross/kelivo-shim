@@ -270,7 +270,10 @@ function replayTurn(entries = transcript) {
 
 // ---- 常驻 claude 进程 --------------------------------------------------------
 let proc = null, outBuf = "", busy = false, spawnedSystem = "", spawnedModel = MODEL;
-let promptMode = SYSTEM_PROMPT_MODE; // 实际生效的模式(replace 可能因 CLI 不支持而降级),/debug 查
+// 实际生效的模式(replace 可能因 CLI 不支持而降级)。spawn 之前是 null ——
+// /debug 那里如实报「还没起进程」,不要让面板显示一个还没验证过的 replace(手册 §9:
+// 一个看起来对、其实还没生效的读数,比没有读数更能把人带沟里)。
+let promptMode = null;
 const queue = [];
 let turn = null;
 let lastUsage = null; // 最近一轮的完整 usage(含缓存字段),/debug 查 // 当前在处理的 { sse, resolve, fullText, curThinking, thinkOpen, textOpen, idx, done }
@@ -586,7 +589,7 @@ app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
   // 系统提示词:append=CC 默认那份还在(锚点压着);replace=已整段换掉(前缀少约 4800 token)
   systemPrompt: {
-    mode: promptMode, configured: SYSTEM_PROMPT_MODE,
+    mode: promptMode || "(claude 进程还没起,尚未生效)", configured: SYSTEM_PROMPT_MODE,
     file: SYSTEM_PROMPT_MODE === "replace" ? SYSTEM_PROMPT_FILE : null,
     fileLoaded: SYSTEM_PROMPT_MODE === "replace" && !!SYSTEM_PROMPT_FILE && fs.existsSync(SYSTEM_PROMPT_FILE),
   },
