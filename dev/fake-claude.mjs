@@ -15,8 +15,9 @@
 // 另外两个开关,给系统提示词模式的接线测试用:
 //   FAKE_HELP_HAS_SYSTEM_PROMPT=1  → `--help` 里印出 --system-prompt,冒充新版 CLI
 //   FAKE_ARGV_OUT=<path>           → 把这次收到的 argv 落盘,测试据此断言 shim 传了什么
+//   FAKE_INPUT_OUT=<path>          → 把每轮收到的用户文本追加落盘(唤醒轮的正文靠它验)
 
-import { writeFileSync } from "node:fs";
+import { writeFileSync, appendFileSync } from "node:fs";
 
 if (process.argv.includes("--help")) {
   // 只印测试关心的那一行;真 CLI 从 2.1.239 起有这个参数,旧版没有。
@@ -44,6 +45,9 @@ process.stdin.on("data", (c) => {
     const text = typeof content === "string"
       ? content
       : Array.isArray(content) ? content.map((b) => b.text || "").join(" ") : "";
+    if (process.env.FAKE_INPUT_OUT) {
+      try { appendFileSync(process.env.FAKE_INPUT_OUT, text + "\n\u0000\n"); } catch {}
+    }
     setTimeout(() => reply(text), 5);
   }
 });

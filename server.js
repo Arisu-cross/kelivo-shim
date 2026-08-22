@@ -615,6 +615,8 @@ app.get("/debug", (_q, r) => r.json({
   // 出站兜底:pending>0 = 有他的话卡在路上还没送到她手机(排查「他怎么不回我」第一眼看这里)
   outbox: { pending: outbox.size() },
   wake: {
+    // prompt: 正文从哪来(env / 文件 / 内置默认)—— 「我改了文案怎么没变」第一眼看这里
+    prompt: process.env.WAKE_PROMPT ? "env" : (fs.existsSync(WAKE_PROMPT_FILE) ? WAKE_PROMPT_FILE : "内置默认"),
     bark: !!BARK_KEY,
     tg: !!TG_TOKEN, tgLocked: !!tgChatId,
     lastUserAt: new Date(lastUserAt).toISOString(),
@@ -646,6 +648,23 @@ app.post("/precompact-gate", (req, res) => {
 const BARK_KEY = process.env.BARK_KEY || "";
 const WAKE_CHECK_MIN = +(process.env.WAKE_CHECK_MIN || 10); // 检查频率
 const WAKE_IDLE_MIN = +(process.env.WAKE_IDLE_MIN || 50);   // 空闲阈值,略小于缓存 TTL(60min)
+// 唤醒轮正文。措辞是「他这段时间怎么过」的全部依据,会反复调 —— 所以做成**文件**:
+// 正本放 /persona 卷(私人内容不进这个公开仓库),开机由人设保险箱复印到 /src,
+// **每次唤醒都重新读一遍**,改了立刻生效,不用重启、更不用换窗。
+// 优先级:WAKE_PROMPT 环境变量 > WAKE_PROMPT_FILE 文件 > 下面这份通用默认。
+// ⚠️ 标记写「【系统·心跳】」是为了和人设里那段对上(旧代码写的是「自主时间」,人设写的是
+//    「心跳」,两边一直错位)。改这个词之前先看人设里叫什么,别再制造一次不一致。
+const WAKE_TAG = "【系统·心跳】";
+const WAKE_PROMPT_FILE = process.env.WAKE_PROMPT_FILE ?? "wake-prompt.md";
+const DEFAULT_WAKE_BODY = "这轮是留给你自己的。没什么想说的就只回【沉默】两个字,这轮只用来保持你的状态和记忆连续。";
+function wakeBody() {
+  if (process.env.WAKE_PROMPT) return process.env.WAKE_PROMPT.trim();
+  try {
+    const t = fs.readFileSync(WAKE_PROMPT_FILE, "utf8").trim();
+    if (t) return t;
+  } catch { /* 文件不在 = 用默认,不吭声:这是常态,不是故障 */ }
+  return DEFAULT_WAKE_BODY;
+}
 let lastUserAt = Date.now();
 let lastTurnAt = Date.now();  // 任何一轮完成都会刷新缓存 TTL(handleEvent result 里更新)
 let lastSpokeAt = 0;          // 上次真的主动开口(推送出去)的时刻
@@ -681,7 +700,12 @@ function wakeTurn(idleUserMin) {
   };
   enqueue({
     kind: "wake",
-    text: `【系统·自主时间】现在北京时间 ${now},她已约 ${Math.round(idleUserMin)} 分钟没有消息${sinceSpoke}。这轮是留给你自己的:${speakLine}没什么想说的就只回【沉默】两个字,这轮只用来保持你的状态和记忆连续。`,
+    // 时间行(shim 才知道的事实)→ 正文(她写的,可热改)→ 发消息的机制说明(取决于当前通道)
+    text: [
+      `${WAKE_TAG}现在北京时间 ${now},她已约 ${Math.round(idleUserMin)} 分钟没有消息${sinceSpoke}。`,
+      wakeBody(),
+      speakLine,
+    ].join("\n"),
     images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
   });
 }
