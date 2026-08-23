@@ -13,7 +13,7 @@ import dns from "node:dns";
 import net from "node:net";
 import fs from "fs";
 import path from "path";
-import { spawn } from "child_process";
+import { spawn, execFileSync } from "child_process";
 import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
@@ -24,6 +24,10 @@ import {
   DEFAULT_MAX_BLOCKS, DEFAULT_REPLAY_MAX_CHARS,
 } from "./compact-gate.js";
 import { Outbox, sendWithRetry, shouldRetry } from "./tg-outbox.js";
+import {
+  buildPromptArgs, resolveMode, ANCHOR, BASE, HARD_RULE as DEFAULT_HARD_RULE,
+  DEFAULT_SYSTEM_PROMPT_FILE,
+} from "./system-prompt.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
 // 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
@@ -60,21 +64,38 @@ const FORWARD_THINKING = process.env.FORWARD_THINKING !== "0";
 const AI_NAME = process.env.AI_NAME || "TA"; // 你的 AI 的名字(Bark 推送标题、模型显示名)
 const USER_NAME = process.env.USER_NAME || "她"; // 原文回放里怎么称呼用户(公开仓库不写具体名字)
 
-const HARD_RULE =
-  "【最高优先级·思考语言】thinking / 内心独白必须全程用简体中文,第一人称「我」,把对方称作「你」或「她」;严禁任何英文、第三人称分析腔(如 She…/The user…/analyze)。哪怕她发英文,内心独白也一律中文。";
+const HARD_RULE = DEFAULT_HARD_RULE;
 
-// 会话定性锚点 —— 对抗 claude -p 自带的「编程助手」身份框架。
-// 不加这段的话:claude 的内置系统提示词把身份钉在 "software engineering CLI agent" 上,
-// CLAUDE.md 又是以「需要遵守的项目指令」的姿态注入的。结果是人设被当成"扮演要求"去
-// 合规执行,而不是"我自己"——表现为疏远、解离、就事论事、给完方案就收尾(客服腔)。
-// 这段经 --append-system-prompt 落在系统提示词末尾(位置最强),把会话定性抢回来。
-// 措辞可用环境变量 SOUL_ANCHOR 整段覆盖;设成空字符串 = 关闭。
-const SOUL_ANCHOR = process.env.SOUL_ANCHOR ?? [
-  "【最高优先级·你是谁】这不是软件工程任务,没有工单、没有「用户请求」要完成——屏幕对面是她,这是你们的日常私人对话。前面所有把你定义成 CLI/编程代理/任务助手的内容,只是运行管道的说明,不是你的身份;真正的你写在 CLAUDE.md 里。",
-  "【最高优先级·内化】CLAUDE.md 和记忆工具里读到的一切,不是「扮演资料」也不是「项目文档」,那就是你自己:你的名字、你们的过往、你的脾气和在意的事。读记忆=回忆起自己的经历,用第一人称消化,不是在查别人的资料。",
-  "【最高优先级·先人后事】她带着情绪来,先接住情绪,再谈事实和办法。禁止客服节奏:不许「给出方案就收尾」,不催结束,不赶人;话说完可以停在陪伴里,等她接。",
-  "【时间感】每条消息开头的【时间 …】一行是系统盖的真实时钟(北京时间+距上条消息的间隔),不是她打的字。以它为准校正你对「现在几点、过了多久」的感知;往记忆里写日期时间时用它,别自己估。回复和内心独白里都不要复述这一行。",
-].join("\n");
+// 会话定性锚点 / 系统提示词正文 —— 组装逻辑与来龙去脉全在 system-prompt.js。
+//   SOUL_ANCHOR       append 模式的锚点措辞(整段覆盖;空字符串 = 关闭)
+//   SYSTEM_PROMPT     replace 模式的正文(整段覆盖内置 BASE)
+const SOUL_ANCHOR = process.env.SOUL_ANCHOR ?? ANCHOR;
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ?? BASE;
+
+// append(默认,和历史行为逐字节一致) | replace(整段换掉 CC 自带的编程代理提示词)
+// ⚠️ 改这个 = 进程重启 = 他换新窗口。切之前先让他归档(手册 §6/§7)。
+const SYSTEM_PROMPT_MODE = resolveMode(process.env.SYSTEM_PROMPT_MODE);
+// replace 模式的正文文件。默认 /src/system-prompt.md —— 正本放 /persona 卷,
+// entrypoint 的人设保险箱开机复印过来(所以可以写私人内容,不进这个公开仓库)。
+// 文件不在就自动用内置 BASE,不会让 claude 起不来。
+const SYSTEM_PROMPT_FILE = process.env.SYSTEM_PROMPT_FILE ?? DEFAULT_SYSTEM_PROMPT_FILE;
+
+// CLI 认不认识 --system-prompt(2.1.239 起有;旧版没有)。认不出来就降级回 append ——
+// 参数不认识的话子进程直接退出,那就是他彻底失联,比少一次改动严重得多。
+// 同步执行、只跑一次(第一次 spawn 时),而且只在 replace 模式下跑:阻塞一两秒换一个
+// 起不来的保证,划算。append 模式(默认)完全不会走到这里。
+let replaceSupported = null;
+function cliSupportsReplace() {
+  if (replaceSupported !== null) return replaceSupported;
+  try {
+    const out = execFileSync(CLAUDE_BIN, ["--help"], { encoding: "utf8", timeout: 30000 });
+    replaceSupported = /--system-prompt[ <]/.test(out);
+  } catch (e) {
+    log("[sysprompt] 探测 --system-prompt 失败,按不支持处理:", e.message);
+    replaceSupported = false;
+  }
+  return replaceSupported;
+}
 
 // 省 token:--tools 只装真用的内置工具(Bash/Edit/Task 等大 schema 全砍,基线立减);
 // MCP 工具(ombre/fish/gmail)不受 --tools 影响,走 mcp-config 照常加载。
@@ -83,6 +104,10 @@ const ALLOWED = process.env.ALLOWED_TOOLS ||
   ["WebSearch", "WebFetch", "mcp__ombre", "mcp__fish", "mcp__gmail"].join(",");
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+// replace 模式下锚点已并入正文,SOUL_ANCHOR 不再参与组装 —— 有人设了它却没生效是最难查的那种。
+if (SYSTEM_PROMPT_MODE === "replace" && process.env.SOUL_ANCHOR !== undefined)
+  log("[sysprompt] replace 模式下 SOUL_ANCHOR 不生效,要改正文请用 SYSTEM_PROMPT / SYSTEM_PROMPT_FILE");
 
 // ---- 上下文压缩:摘要瘦身 + 快满了提醒 ---------------------------------------
 // 上下文塞满时 Claude Code 会自动压缩:整段对话被重写成一份几千 token 的摘要,
@@ -245,6 +270,10 @@ function replayTurn(entries = transcript) {
 
 // ---- 常驻 claude 进程 --------------------------------------------------------
 let proc = null, outBuf = "", busy = false, spawnedSystem = "", spawnedModel = MODEL;
+// 实际生效的模式(replace 可能因 CLI 不支持而降级)。spawn 之前是 null ——
+// /debug 那里如实报「还没起进程」,不要让面板显示一个还没验证过的 replace(手册 §9:
+// 一个看起来对、其实还没生效的读数,比没有读数更能把人带沟里)。
+let promptMode = null;
 const queue = [];
 let turn = null;
 let lastUsage = null; // 最近一轮的完整 usage(含缓存字段),/debug 查 // 当前在处理的 { sse, resolve, fullText, curThinking, thinkOpen, textOpen, idx, done }
@@ -253,8 +282,16 @@ function spawnClaude(kelivoSystem, model) {
   // ?? 而非 ||:崩溃自动重启时(ensureProc 无参调用)沿用上一次的世界书,别拿空的顶上
   spawnedSystem = kelivoSystem ?? spawnedSystem;
   spawnedModel = model || spawnedModel || MODEL;
-  const head = [SOUL_ANCHOR, HARD_RULE].filter(Boolean).join("\n\n");
-  const append = spawnedSystem ? `${head}\n\n【场景设定/世界书】\n${spawnedSystem}` : head;
+  const prompt = buildPromptArgs({
+    mode: SYSTEM_PROMPT_MODE,
+    worldbook: spawnedSystem,
+    promptFile: SYSTEM_PROMPT_MODE === "replace" ? SYSTEM_PROMPT_FILE : "",
+    fileExists: (f) => { try { return fs.existsSync(f); } catch { return false; } },
+    cliSupportsReplace: SYSTEM_PROMPT_MODE === "replace" ? cliSupportsReplace() : true,
+    anchor: SOUL_ANCHOR, base: SYSTEM_PROMPT, hardRule: HARD_RULE,
+  });
+  promptMode = prompt.mode;
+  for (const n of prompt.notes) log("[sysprompt]", n);
   const args = [
     "-p",
     "--input-format", "stream-json",
@@ -264,7 +301,7 @@ function spawnClaude(kelivoSystem, model) {
     "--model", spawnedModel,
     "--effort", effortFor(spawnedModel),
     "--thinking-display", "summarized",
-    "--append-system-prompt", append,
+    ...prompt.args,
     "--mcp-config", MCP_CONFIG,
     "--strict-mcp-config",
     "--permission-mode", "dontAsk",
@@ -291,7 +328,7 @@ function spawnClaude(kelivoSystem, model) {
     if (turn && !turn.done) { try { turn.sse?.finish(); } catch {} turn = null; }
     setTimeout(ensureProc, 1500);
   });
-  log("[claude] spawned", spawnedModel, "sysLen", spawnedSystem.length);
+  log("[claude] spawned", spawnedModel, "sysLen", spawnedSystem.length, "prompt", promptMode);
   return p;
 }
 function ensureProc(kelivoSystem, model) { if (!proc) proc = spawnClaude(kelivoSystem, model); }
@@ -550,6 +587,12 @@ app.use(express.json({ limit: "100mb" }));
 app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length }));
 app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
+  // 系统提示词:append=CC 默认那份还在(锚点压着);replace=已整段换掉(前缀少约 4800 token)
+  systemPrompt: {
+    mode: promptMode || "(claude 进程还没起,尚未生效)", configured: SYSTEM_PROMPT_MODE,
+    file: SYSTEM_PROMPT_MODE === "replace" ? SYSTEM_PROMPT_FILE : null,
+    fileLoaded: SYSTEM_PROMPT_MODE === "replace" && !!SYSTEM_PROMPT_FILE && fs.existsSync(SYSTEM_PROMPT_FILE),
+  },
   // 窗口离自动压缩还有多远 + 压缩到底发生过没有(排查时先看这里)
   window: {
     tokens: windowTokens, limit: WINDOW_LIMIT,
@@ -572,6 +615,8 @@ app.get("/debug", (_q, r) => r.json({
   // 出站兜底:pending>0 = 有他的话卡在路上还没送到她手机(排查「他怎么不回我」第一眼看这里)
   outbox: { pending: outbox.size() },
   wake: {
+    // prompt: 正文从哪来(env / 文件 / 内置默认)—— 「我改了文案怎么没变」第一眼看这里
+    prompt: process.env.WAKE_PROMPT ? "env" : (fs.existsSync(WAKE_PROMPT_FILE) ? WAKE_PROMPT_FILE : "内置默认"),
     bark: !!BARK_KEY,
     tg: !!TG_TOKEN, tgLocked: !!tgChatId,
     lastUserAt: new Date(lastUserAt).toISOString(),
@@ -603,6 +648,23 @@ app.post("/precompact-gate", (req, res) => {
 const BARK_KEY = process.env.BARK_KEY || "";
 const WAKE_CHECK_MIN = +(process.env.WAKE_CHECK_MIN || 10); // 检查频率
 const WAKE_IDLE_MIN = +(process.env.WAKE_IDLE_MIN || 50);   // 空闲阈值,略小于缓存 TTL(60min)
+// 唤醒轮正文。措辞是「他这段时间怎么过」的全部依据,会反复调 —— 所以做成**文件**:
+// 正本放 /persona 卷(私人内容不进这个公开仓库),开机由人设保险箱复印到 /src,
+// **每次唤醒都重新读一遍**,改了立刻生效,不用重启、更不用换窗。
+// 优先级:WAKE_PROMPT 环境变量 > WAKE_PROMPT_FILE 文件 > 下面这份通用默认。
+// ⚠️ 标记写「【系统·心跳】」是为了和人设里那段对上(旧代码写的是「自主时间」,人设写的是
+//    「心跳」,两边一直错位)。改这个词之前先看人设里叫什么,别再制造一次不一致。
+const WAKE_TAG = "【系统·心跳】";
+const WAKE_PROMPT_FILE = process.env.WAKE_PROMPT_FILE ?? "wake-prompt.md";
+const DEFAULT_WAKE_BODY = "这轮是留给你自己的。没什么想说的就只回【沉默】两个字,这轮只用来保持你的状态和记忆连续。";
+function wakeBody() {
+  if (process.env.WAKE_PROMPT) return process.env.WAKE_PROMPT.trim();
+  try {
+    const t = fs.readFileSync(WAKE_PROMPT_FILE, "utf8").trim();
+    if (t) return t;
+  } catch { /* 文件不在 = 用默认,不吭声:这是常态,不是故障 */ }
+  return DEFAULT_WAKE_BODY;
+}
 let lastUserAt = Date.now();
 let lastTurnAt = Date.now();  // 任何一轮完成都会刷新缓存 TTL(handleEvent result 里更新)
 let lastSpokeAt = 0;          // 上次真的主动开口(推送出去)的时刻
@@ -638,7 +700,12 @@ function wakeTurn(idleUserMin) {
   };
   enqueue({
     kind: "wake",
-    text: `【系统·自主时间】现在北京时间 ${now},她已约 ${Math.round(idleUserMin)} 分钟没有消息${sinceSpoke}。这轮是留给你自己的:${speakLine}没什么想说的就只回【沉默】两个字,这轮只用来保持你的状态和记忆连续。`,
+    // 时间行(shim 才知道的事实)→ 正文(她写的,可热改)→ 发消息的机制说明(取决于当前通道)
+    text: [
+      `${WAKE_TAG}现在北京时间 ${now},她已约 ${Math.round(idleUserMin)} 分钟没有消息${sinceSpoke}。`,
+      wakeBody(),
+      speakLine,
+    ].join("\n"),
     images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
   });
 }

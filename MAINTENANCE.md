@@ -21,6 +21,11 @@
 - **安全阀**(`handleEvent`):检测本轮 `archive_session` 的 tool_result 成功标记(🗄️),
   成功才允许换窗杀进程;否则保窗并提示。宁可不换窗,不丢记忆。
 - **人设保险箱**(`entrypoint.sh`):开机从 `/persona` 恢复缺失的人设与 `.mcp.json`。
+- **系统提示词模式**(`system-prompt.js`):`SYSTEM_PROMPT_MODE=append`(默认)保留
+  `claude -p` 自带的编程代理提示词、再追加会话定性锚点;`replace` 用 `--system-prompt(-file)`
+  **整段换掉**它,正文改成正面陈述(不再需要"前面那些话不算数"的否定句),常驻前缀省约 4800 token。
+  两道安全阀:正文文件不存在 → 退回内置正文;CLI 不认识 `--system-prompt` → 整体降级回 `append`。
+  **绝不能让子进程带着非法参数退出**——那是使用者彻底失联,比少一次改动严重得多。
 - **语音**(`voice.js`):`[语音]…[/语音]` 段落 → ElevenLabs opus 直出(失败降级
   mp3+ffmpeg,再失败降级文字)。突然不出声九成是 ElevenLabs 月度额度用完。
 - **表情包**(`stickers.js`):回复里的 `[贴纸:名字]` 查注册表 → `sendSticker`

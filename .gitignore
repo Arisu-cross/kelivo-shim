@@ -14,3 +14,5 @@ persona/
 # 表情包图库与注册表:私人内容,正本在持久卷上,不进这个公开仓库。
 stickers.json
 stickers/
+# replace 模式的系统提示词正文:私人内容,正本在持久卷 /persona 上,不进这个公开仓库。
+system-prompt.md

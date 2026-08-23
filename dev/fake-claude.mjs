@@ -12,6 +12,24 @@
 //   含 "COMPACT_NOW"     → 先发一个 compact_boundary,再正常回一轮
 // 另外 FAKE_PREFIX 环境变量决定 message_start 报的窗口前缀大小。
 
+// 另外两个开关,给系统提示词模式的接线测试用:
+//   FAKE_HELP_HAS_SYSTEM_PROMPT=1  → `--help` 里印出 --system-prompt,冒充新版 CLI
+//   FAKE_ARGV_OUT=<path>           → 把这次收到的 argv 落盘,测试据此断言 shim 传了什么
+//   FAKE_INPUT_OUT=<path>          → 把每轮收到的用户文本追加落盘(唤醒轮的正文靠它验)
+
+import { writeFileSync, appendFileSync } from "node:fs";
+
+if (process.argv.includes("--help")) {
+  // 只印测试关心的那一行;真 CLI 从 2.1.239 起有这个参数,旧版没有。
+  process.stdout.write(process.env.FAKE_HELP_HAS_SYSTEM_PROMPT === "1"
+    ? "  --system-prompt <prompt>   System prompt to use for the session\n"
+    : "  --append-system-prompt <prompt>   Append a system prompt\n");
+  process.exit(0);
+}
+if (process.env.FAKE_ARGV_OUT) {
+  try { writeFileSync(process.env.FAKE_ARGV_OUT, JSON.stringify(process.argv.slice(2))); } catch {}
+}
+
 let buf = "";
 const PREFIX = +(process.env.FAKE_PREFIX || 1000);
 const out = (o) => process.stdout.write(JSON.stringify(o) + "\n");
@@ -27,6 +45,9 @@ process.stdin.on("data", (c) => {
     const text = typeof content === "string"
       ? content
       : Array.isArray(content) ? content.map((b) => b.text || "").join(" ") : "";
+    if (process.env.FAKE_INPUT_OUT) {
+      try { appendFileSync(process.env.FAKE_INPUT_OUT, text + "\n\u0000\n"); } catch {}
+    }
     setTimeout(() => reply(text), 5);
   }
 });
