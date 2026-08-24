@@ -83,6 +83,8 @@ fi
 #     重启后本段会自动把它复印进 /src 生效。
 #   · 绝对不要把人设文件提交进本仓库——kelivo-shim 是公开 OSS。人设靠 .gitignore 挡在仓库外,
 #     靠 /persona 卷持久化,靠这段自动恢复。三者缺一,就可能白板或泄露。
+#   · SYSTEM_PROMPT_MODE=replace 用的正文文件(默认 system-prompt.md)也是 .md,
+#     放进 /persona 就同样被这段自动补齐;它不在也不会出事,server.js 会退回内置正文。
 if [ -d /persona ]; then
   for f in /persona/*.md; do
     [ -e "$f" ] || continue
