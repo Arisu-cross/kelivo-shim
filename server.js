@@ -48,7 +48,8 @@ const PORT = process.env.PORT || 8787;
 const SHIM_KEY = process.env.SHIM_KEY || "";
 const MODEL = process.env.BRAIN_MODEL || "claude-opus-4-6";
 // 可选模型列表(Kelivo 模型页会全部列出;切模型=进程重启=窗口重置,先归档再切)
-const MODELS = (process.env.BRAIN_MODELS || "claude-opus-4-6,claude-opus-4-8,claude-fable-5")
+// ⚠️ 只是「列出来可选」,不改默认:默认永远是 BRAIN_MODEL,列表里多一个不会自己切过去。
+const MODELS = (process.env.BRAIN_MODELS || "claude-opus-4-6,claude-opus-4-8,claude-fable-5,claude-sonnet-4-6")
   .split(",").map((s) => s.trim()).filter(Boolean);
 if (!MODELS.includes(MODEL)) MODELS.unshift(MODEL);
 const EFFORT = process.env.THINK_EFFORT || "low";

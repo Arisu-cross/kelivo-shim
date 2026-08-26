@@ -494,6 +494,7 @@ npx zeabur@latest deploy --create --name kelivo-shim   # 上传部署(交互选�
 | `ANTHROPIC_AUTH_TOKEN` | `<你的API_KEY>` | 组件①的对内key |
 | `SHIM_KEY` | 自己编个 `sk-xxx` | Kelivo 要填的 |
 | `BRAIN_MODEL` | `claude-opus-4-6` | 或你订阅里能用的模型 |
+| `BRAIN_MODELS` | (可选)逗号分隔 | Kelivo 模型页列出的可选项;不设走代码默认(含 opus-4-6/4-8、fable-5、sonnet-4-6)。**只是列出来备选,默认仍是 `BRAIN_MODEL`**;在 Kelivo 里切模型 = 进程重启 = 换窗口,先归档再切 |
 | `THINK_EFFORT` | `low` 或 `medium` | 思考深度,low省额度 |
 | `FORWARD_THINKING` | `1` | 思考链透传 |
 | `ENABLE_PROMPT_CACHING_1H` | `1` | **1小时缓存**,零散聊天省大钱,见 §6 |
