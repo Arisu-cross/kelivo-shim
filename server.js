@@ -25,6 +25,10 @@ import {
 } from "./compact-gate.js";
 import { Outbox, sendWithRetry, shouldRetry } from "./tg-outbox.js";
 import {
+  normalizeAppName, pushActivity, summarizeActivity,
+  takeCheckMarker, lookupPrompt, isSilentReply,
+} from "./check.js";
+import {
   buildPromptArgs, resolveMode, ANCHOR, BASE, HARD_RULE as DEFAULT_HARD_RULE,
   DEFAULT_SYSTEM_PROMPT_FILE,
 } from "./system-prompt.js";
@@ -457,6 +461,13 @@ function handleEvent(ev) {
     }
     const wantSwitch = turn.newWindow;
     const archivedOk = turn.archiveOk;
+    // [查岗] 是他对系统说的话,不是对她说的:在这里一次剥干净,Telegram / Kelivo 非流式 /
+    // 心跳三个出口拿到的都是剥过的正文。**流式的 Kelivo 例外** —— 字已经边生成边吐出去了,
+    // 和 [语音] / [贴纸] 一样,标记在 Kelivo 里会露出来(Telegram 是主通道,那边干净)。
+    // 功能没开(REPORT_ON=false)时故意不剥:让标记露出来,好过安静地什么都不发生。
+    const { text: outText, wants: wantsCheck } = REPORT_ON
+      ? takeCheckMarker(turn.fullText)
+      : { text: turn.fullText, wants: false };
     // 安全阀:想换窗但没成功归档 → 不换窗、保住窗口、提示她(宁可不换,绝不丢记忆)
     if (wantSwitch && !archivedOk) {
       turn.sse?.text("\n\n⚠️〔窗口保住了〕这次没成功归档,为防丢记忆没有换窗。想换新窗口,请先确认归档成功。");
@@ -465,8 +476,8 @@ function handleEvent(ev) {
     // 这一轮又产生了没归档的内容(归档成功的那一轮除外 —— 它刚把账清干净)。
     // 例外:自主时间回【沉默】的空轮不算,否则压缩后一条【沉默】就能把闸门重新拉起来。
     if (!archivedOk) {
-      const said = turn.fullText.trim();
-      const silentWake = turn.kind === "wake" && (!said || said.includes("【沉默】"));
+      const said = outText.trim();
+      const silentWake = (turn.kind === "wake" || turn.kind === "lookup") && isSilentReply(said);
       if (said) recordTranscript("assistant", said);
       if (!silentWake) dirty = true;
     }
@@ -483,12 +494,17 @@ function handleEvent(ev) {
     }
     const usage = ev.usage ? { output_tokens: ev.usage.output_tokens } : undefined;
     const doKill = wantSwitch && archivedOk && proc;
+    // 查岗:他这轮写了 [查岗] → 等这轮彻底收尾后再补一轮把结果喂回去。
+    // ⚠️ 防打转的命根子:结果轮(kind=lookup)自己再写标记一律不理,否则无限循环。
+    // 换窗那轮也不查——进程马上要被杀,查了会变成新窗口的第一句话。
+    const wantsLookup = wantsCheck && turn.kind !== "lookup" && !doKill;
     turn.done = true;
-    turn.sse?.finish(usage, turn.fullText);
+    turn.sse?.finish(usage, outText, { wantsCheck });
     turn = null;
     busy = false;
     if (doKill) { log("[window] archived ok, restarting proc"); try { proc.kill(); } catch {} proc = null; }
     pump();
+    if (wantsLookup) queueLookup();
   }
 }
 
@@ -614,6 +630,9 @@ app.get("/debug", (_q, r) => r.json({
   stickers: { count: stickerNames().length },         // 表情包图库有几张
   // 出站兜底:pending>0 = 有他的话卡在路上还没送到她手机(排查「他怎么不回我」第一眼看这里)
   outbox: { pending: outbox.size() },
+  // 查岗:⚠️ 这个 /debug 是裸奔的(手册 §9),所以这里**只报条数**。
+  // App 名和时间在带钥匙的 /activity 里 —— 她的行踪不放在公网可读的口子上。
+  report: { on: REPORT_ON, count: activity.length },
   wake: {
     // prompt: 正文从哪来(env / 文件 / 内置默认)—— 「我改了文案怎么没变」第一眼看这里
     prompt: process.env.WAKE_PROMPT ? "env" : (fs.existsSync(WAKE_PROMPT_FILE) ? WAKE_PROMPT_FILE : "内置默认"),
@@ -677,8 +696,12 @@ async function barkPush(text) {
   });
   log("[bark]", r.status);
 }
+// 北京时间「YYYY-MM-DD HH:MM」——喂给他的系统轮次里都用这一份(容器时钟是 UTC)。
+function bjNowStr() {
+  return new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 16).replace("T", " ");
+}
 function wakeTurn(idleUserMin) {
-  const now = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 16).replace("T", " ");
+  const now = bjNowStr();
   const sinceSpoke = lastSpokeAt
     ? `,你上次主动开口是约 ${Math.round((Date.now() - lastSpokeAt) / 60000)} 分钟前`
     : "";
@@ -692,7 +715,7 @@ function wakeTurn(idleUserMin) {
     text() {}, thinking() {},
     finish(_u, fullText) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
-      if (!t || t.includes("【沉默】")) { log("[wake] silent"); return; }
+      if (isSilentReply(t)) { log("[wake] silent"); return; }
       lastSpokeAt = Date.now();
       if (canTg) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
       else if (BARK_KEY) barkPush(t).catch((e) => log("[bark-err]", e.message));
@@ -945,7 +968,7 @@ async function tgSendSticker(name) {
 // 一轮回复的统一出口:切语音/贴纸/文字段,按出现顺序发。
 // 贴纸只在文字段里找——语音段的内容整段送 TTS,不该被解析。
 async function tgSendReply(text) {
-  if (!tgChatId || !text) return;
+  if (!tgChatId || !(text || "").trim()) return;
   const segs = [];
   for (const s of splitVoiceSegments(text)) {
     if (s.type === "text") segs.push(...splitStickerSegments(s.content, hasSticker));
@@ -1148,13 +1171,14 @@ async function handleTgMessage(m) {
   let think = "";
   const sink = {
     text() {}, thinking(t) { if (TG_THINKING) think += t; },
-    finish(_u, fullText) {
+    finish(_u, fullText, meta) {
       clearInterval(typing);
       const t = (fullText || "").replace(/‖/g, "\n").trim();
       (async () => {
         // 两步各自兜底:思考链出任何问题都不许连累正文。正文是他对她说的话,优先保住。
         if (think.trim()) await tgSendThinking(think.trim()).catch((e) => log("[tg-think-err]", e.message));
-        await tgSendReply(t || "…").catch((e) => log("[tg-err]", e.message));
+        // 空回复兜底发个「…」,免得她那边一片安静;但「只写了个 [查岗]」是他故意不说话,不顶。
+        await tgSendReply(t || (meta?.wantsCheck ? "" : "…")).catch((e) => log("[tg-err]", e.message));
       })().catch((e) => log("[tg-err]", e.message));
     },
   };
@@ -1215,6 +1239,80 @@ app.get("/aw", (req, res) => {
     .filter((x) => Object.keys(x.data).length > 0);
   res.json({ now: new Date().toISOString(), count: cleaned.length, entries: cleaned.slice(-12) });
 });
+
+// ---- 手机行踪上报 + 查岗 --------------------------------------------------------
+// 她点开某个 App → iOS 快捷指令 GET /report?key=…&app=<当前App> → 攒在内存里(48h/300 条)。
+// 他想知道的时候在回复里写 [查岗],结果作为**新一轮**喂回给他,他再决定说不说。
+// 纯逻辑与单测在 check.js / test/check.test.js。
+//
+// 钥匙**故意和 SHIM_KEY 分开**:这一把要存进她手机的快捷指令里,泄露只影响这个功能。
+// 不设 REPORT_TOKEN = 整套静默关闭(接口 503,快捷指令那边静默失败,手机无感)。
+const REPORT_TOKEN = process.env.REPORT_TOKEN || "";
+const REPORT_ON = !!REPORT_TOKEN;
+let activity = [];        // 只在内存,重启即忘。行踪不值得为了历史落盘。
+let lastRawReport = null; // 最近一次上报的原始内容——排障命根子,别删
+
+function reportAuth(req) {
+  const bearer = (req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+  const k = bearer || req.get("x-api-key") || req.query.key || "";
+  return REPORT_ON && k === REPORT_TOKEN;
+}
+
+// ⚠️ GET 和 POST 都接:iOS 快捷指令实测只有「GET + 一条请求头都不加」通得了。
+function handleReport(req, res) {
+  if (!REPORT_ON) return res.status(503).json({ ok: false, error: "REPORT_TOKEN 未配置" });
+  if (!reportAuth(req)) {
+    // ⚠️ 这行别删:「请求根本没到」和「到了但钥匙不对」长得一模一样,全靠它分辨。
+    log("[report] 401", req.method, "带没带 key:", !!(req.query.key || req.get("authorization")));
+    return res.status(401).json({ ok: false });
+  }
+  const src = { ...(req.query || {}), ...(typeof req.body === "object" && req.body ? req.body : {}) };
+  // 请求头里的非 ASCII 到 Node 手上是 latin1 字节,还原成 UTF-8 才是中文。
+  // (网址里的裸中文会被 Node 的 HTTP 解析器在进 express 之前判 400,所以留这条不吃转码的路。)
+  const hdrApp = req.get("x-app") || "";
+  const hdrDecoded = hdrApp ? Buffer.from(hdrApp, "latin1").toString("utf8") : "";
+  // ⚠️ 原始 query 里带着钥匙本身,别原样留下、更别从 /activity 回显出去(手册 §9「别用会打印凭据的命令」)
+  const { key: _k, ...safeQuery } = req.query || {};
+  lastRawReport = { at: Date.now(), method: req.method, query: safeQuery, body: req.body ?? null, xApp: hdrDecoded || null };
+  const app_name = normalizeAppName(src.app_name ?? src.app ?? hdrDecoded);
+  if (!app_name) { log("[report] 到了,但没带 App 名"); return res.json({ ok: true, stored: false }); }
+  activity = pushActivity(activity, { app: app_name });
+  log("[report] 收到一条,共", activity.length, "条");   // 只记条数:App 名是她的行踪,不进日志
+  res.json({ ok: true, stored: true, count: activity.length });
+}
+app.post("/report", handleReport);
+app.get("/report", handleReport);
+
+// 排障口。⚠️ 必须带钥匙:这里会吐 App 名(≠ 裸奔的 /debug,那边只报条数)。
+app.get("/activity", (req, res) => {
+  if (!REPORT_ON) return res.status(503).json({ ok: false });
+  if (!reportAuth(req)) return res.status(401).json({ ok: false });
+  res.json({ now: new Date().toISOString(), ...summarizeActivity(activity), lastRawReport });
+});
+
+// 查岗轮:把查到的作为新一轮喂回去。kind=lookup 让这一轮不再响应标记(防打转),
+// 也让它像心跳轮一样**不算「她出现了」**——直接 enqueue,不走 submitTurn:
+// lastUserAt 不动、不过 detectReset、不进原文缓冲。他自己伸头看一眼,不等于她回来了。
+function queueLookup() {
+  if (!REPORT_ON) return;
+  const sink = {
+    text() {}, thinking() {},
+    finish(_u, fullText) {
+      const t = (fullText || "").replace(/‖/g, "\n").trim();
+      if (isSilentReply(t)) { log("[lookup] 他选择不打扰"); return; }
+      lastSpokeAt = Date.now();   // 与心跳共用:保证查岗和心跳不会挨着说话
+      // 退路和心跳轮一模一样:没有 TG 就走 Bark。他真开了口就不能静默蒸发。
+      if (tgChatId) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
+      else if (BARK_KEY) barkPush(t).catch((e) => log("[bark-err]", e.message));
+    },
+  };
+  log("[lookup] 他要看一眼");
+  enqueue({
+    kind: "lookup",
+    text: lookupPrompt(summarizeActivity(activity), { bjNow: bjNowStr() }),
+    images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
+  });
+}
 
 // Kelivo 的「模型」页拉这个列表来选模型。Anthropic /v1/models 格式。
 function listModels(_req, res) {

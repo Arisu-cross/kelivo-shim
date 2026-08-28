@@ -10,6 +10,9 @@
 //   含 "archive_session" → 演成功归档(tool_use + tool_result 带 🗄️)
 //   含 "ARCHIVE_FAIL"    → 演归档失败(tool_result 不带 🗄️)
 //   含 "COMPACT_NOW"     → 先发一个 compact_boundary,再正常回一轮
+//   含 "CHECK_NOW"      → 回复里写一个 [查岗](演他想看一眼她手机上的动静)
+//   含 "【系统·查岗】"   → 这是查岗结果那一轮:**故意再写一次 [查岗]**,用来钉死防打转;
+//                        回什么由 FAKE_LOOKUP_REPLY 决定(默认写标记,设成「【沉默】」演他不打扰)
 // 另外 FAKE_PREFIX 环境变量决定 message_start 报的窗口前缀大小。
 
 // 另外两个开关,给系统提示词模式的接线测试用:
@@ -73,7 +76,10 @@ function reply(text) {
     });
   }
 
-  const say = wantFail ? "没存上" : wantArchive ? "存好了" : "嗯,在听";
+  const isLookup = text.includes("【系统·查岗】");
+  const say = isLookup ? (process.env.FAKE_LOOKUP_REPLY ?? "还没睡?[查岗]")
+    : text.includes("CHECK_NOW") ? "嗯。[查岗]"
+    : wantFail ? "没存上" : wantArchive ? "存好了" : "嗯,在听";
   out({ type: "stream_event", event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: say } } });
   out({ type: "result", subtype: "success", usage: { output_tokens: 5 } });
 }
