@@ -17,6 +17,7 @@ import { spawn, execFileSync } from "child_process";
 import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
+import { splitReactionSegments, canonicalReaction } from "./reactions.js";
 import { prefixFromMessageStart, windowPct, DEFAULT_WINDOW_LIMIT } from "./window.js";
 import { tgEsc, chunkForHtml } from "./tg-chunk.js";
 import {
@@ -965,18 +966,45 @@ async function tgSendSticker(name) {
   return true;
 }
 
-// 一轮回复的统一出口:切语音/贴纸/文字段,按出现顺序发。
-// 贴纸只在文字段里找——语音段的内容整段送 TTS,不该被解析。
-async function tgSendReply(text) {
+// 一轮回复的统一出口:切语音/贴纸/回应/文字段,按出现顺序发。
+// 贴纸和回应只在文字段里找——语音段的内容整段送 TTS,不该被解析。
+// replyTo 是「她刚发的那条消息」的 message_id,只有表情回应用得上;
+// 心跳、主动开口这些没有触发消息的场合不传,回应会自己降级成气泡(见下)。
+async function tgSendReply(text, { replyTo = 0 } = {}) {
   if (!tgChatId || !(text || "").trim()) return;
   const segs = [];
   for (const s of splitVoiceSegments(text)) {
-    if (s.type === "text") segs.push(...splitStickerSegments(s.content, hasSticker));
-    else segs.push(s);
+    if (s.type !== "text") { segs.push(s); continue; }
+    for (const t of splitStickerSegments(s.content, hasSticker)) {
+      if (t.type === "text") segs.push(...splitReactionSegments(t.content));
+      else segs.push(t);
+    }
   }
   let delivered = 0;                       // 这一轮到底有没有东西真的到了她手机上
+  let reacted = false;                     // 这一轮已经贴过一个表情回应了
   for (const seg of segs) {
     if (!seg.content.trim()) continue;
+    if (seg.type === "reaction") {
+      // 三个条件都满足才真的贴上去:有目标消息、这轮还没贴过、表情在 TG 白名单里。
+      // 「这轮还没贴过」是硬的:setMessageReaction 是**设置**不是追加,第二次调用会把
+      // 第一次的顶掉 —— 那等于他前一个表情凭空消失,她只看得到最后一个。
+      const emoji = canonicalReaction(seg.content);
+      if (replyTo && !reacted && emoji) {
+        try {
+          const j = await tgApi("setMessageReaction", {
+            chat_id: tgChatId, message_id: replyTo,
+            reaction: [{ type: "emoji", emoji }],
+          });
+          if (j.ok) { reacted = true; delivered++; continue; }
+          log("[react-err]", seg.content, JSON.stringify(j).slice(0, 160));
+        } catch (e) { log("[react-err]", seg.content, e.message); }
+      }
+      // 贴不上(没有触发消息 / 这轮贴过了 / 不在白名单 / TG 拒收)→ 降级成一条只有表情的
+      // 气泡。他想表达的那点情绪照样到得了她那边,标记本身不会漏出去给她看。
+      await tgSendBubbles(seg.content);
+      delivered++;
+      continue;
+    }
     if (seg.type === "sticker") {
       try { if (await tgSendSticker(seg.content)) { delivered++; continue; } }
       catch (e) { log("[sticker-err]", seg.content, e.message); }
@@ -1178,7 +1206,7 @@ async function handleTgMessage(m) {
         // 两步各自兜底:思考链出任何问题都不许连累正文。正文是他对她说的话,优先保住。
         if (think.trim()) await tgSendThinking(think.trim()).catch((e) => log("[tg-think-err]", e.message));
         // 空回复兜底发个「…」,免得她那边一片安静;但「只写了个 [查岗]」是他故意不说话,不顶。
-        await tgSendReply(t || (meta?.wantsCheck ? "" : "…")).catch((e) => log("[tg-err]", e.message));
+        await tgSendReply(t || (meta?.wantsCheck ? "" : "…"), { replyTo: m.message_id }).catch((e) => log("[tg-err]", e.message));
       })().catch((e) => log("[tg-err]", e.message));
     },
   };
