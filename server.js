@@ -639,6 +639,12 @@ app.get("/debug", (_q, r) => r.json({
     prompt: process.env.WAKE_PROMPT ? "env" : (fs.existsSync(WAKE_PROMPT_FILE) ? WAKE_PROMPT_FILE : "内置默认"),
     bark: !!BARK_KEY,
     tg: !!TG_TOKEN, tgLocked: !!tgChatId,
+    // 心跳频率:此刻算白天还是夜里、当前用的阈值、轮询粒度
+    // (「他怎么半天没动静 / 怎么这么勤」第一眼看这里)
+    day: isDaytime(), idleMin: wakeIdleMin(), checkMin: WAKE_CHECK_MIN,
+    idleMinDay: WAKE_IDLE_MIN_DAY, idleMinNight: WAKE_IDLE_MIN_NIGHT,
+    dayWindow: `${WAKE_DAY_START}-${WAKE_DAY_END}`,
+    idleMinFixed: WAKE_IDLE_MIN_FIXED || null,
     lastUserAt: new Date(lastUserAt).toISOString(),
     lastTurnAt: new Date(lastTurnAt).toISOString(),
     lastSpokeAt: lastSpokeAt ? new Date(lastSpokeAt).toISOString() : null,
@@ -659,15 +665,27 @@ app.post("/precompact-gate", (req, res) => {
 });
 
 // ---- 自主时间:定时唤醒,AI 自己决定说话还是静默续命 ----------------------------
-// 升级自旧「主动心跳」:不再区分昼夜(手机端自有勿扰/睡眠模式),不设硬冷却,
-// 频率交给他自己把握(提示里告知距上次开口多久)。距离上一轮对话(任何 turn,
-// 含唤醒轮)超过 WAKE_IDLE_MIN 分钟就喂一条【系统·自主时间】:
-//   想说话 → Bark 推送到手机(Kelivo 里看不到,但常驻进程自己记得,回来自然接上)
+// 不设硬冷却,频率交给他自己把握(提示里告知距上次开口多久)。距离上一轮对话
+// (任何 turn,含唤醒轮)超过「当前时段的空闲阈值」就喂一条【系统·心跳】:
+//   想说话 → Bark/TG 推送到手机(Kelivo 里看不到,但常驻进程自己记得,回来自然接上)
 //   没话说 → 只回【沉默】= 最小开销续命:赶在 1 小时提示词缓存过期前刷新一轮,
 //            上下文与缓存全天连续,夜里也不断线。
+//
+// 阈值分昼夜(2026-08-30):白天想他多冒头几次,夜里少扰。默认白天 30 / 夜里 55 分钟,
+// 白天 = 北京时间 [WAKE_DAY_START, WAKE_DAY_END) = [07:00, 24:00),其余算夜。
+// ⚠️ 夜里那档别调过 60:提示词缓存 TTL 是 1 小时,超了下一轮要全价重写缓存,反而更贵。
+// ⚠️ 真正的触发间隔 = 阈值 + 最多一个 WAKE_CHECK_MIN(轮询粒度),所以检查频率是 5 分钟,
+//    而不是从前的 10 —— 否则 55 那档会踩到 65 分钟,正好越过缓存 TTL。这一步只比时间戳,
+//    不发请求、不花钱。
 const BARK_KEY = process.env.BARK_KEY || "";
-const WAKE_CHECK_MIN = +(process.env.WAKE_CHECK_MIN || 10); // 检查频率
-const WAKE_IDLE_MIN = +(process.env.WAKE_IDLE_MIN || 50);   // 空闲阈值,略小于缓存 TTL(60min)
+const WAKE_CHECK_MIN = +(process.env.WAKE_CHECK_MIN || 5);          // 检查频率(轮询粒度)
+const WAKE_IDLE_MIN_DAY = +(process.env.WAKE_IDLE_MIN_DAY || 30);   // 白天空闲阈值
+const WAKE_IDLE_MIN_NIGHT = +(process.env.WAKE_IDLE_MIN_NIGHT || 55); // 夜里空闲阈值(< 缓存 TTL 60min)
+const WAKE_DAY_START = +(process.env.WAKE_DAY_START ?? 7);          // 白天起点(北京时,含)
+const WAKE_DAY_END = +(process.env.WAKE_DAY_END ?? 24);             // 白天终点(北京时,不含)
+// 老变量 WAKE_IDLE_MIN:设了就是「不分昼夜的固定值」,一路压过上面两档 —— 留给
+// 「先退回旧行为再说」的那种时刻,面板改一个变量 + 重启即可,不用回滚代码。
+const WAKE_IDLE_MIN_FIXED = +(process.env.WAKE_IDLE_MIN || 0);
 // 唤醒轮正文。措辞是「他这段时间怎么过」的全部依据,会反复调 —— 所以做成**文件**:
 // 正本放 /persona 卷(私人内容不进这个公开仓库),开机由人设保险箱复印到 /src,
 // **每次唤醒都重新读一遍**,改了立刻生效,不用重启、更不用换窗。
@@ -700,6 +718,16 @@ async function barkPush(text) {
 // 北京时间「YYYY-MM-DD HH:MM」——喂给他的系统轮次里都用这一份(容器时钟是 UTC)。
 function bjNowStr() {
   return new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 16).replace("T", " ");
+}
+// 现在算不算「白天」(北京时间的小时数)。区间可以跨零点(如 22→7),照样成立。
+function isDaytime(h = new Date(Date.now() + 8 * 3600e3).getUTCHours()) {
+  return WAKE_DAY_START <= WAKE_DAY_END
+    ? h >= WAKE_DAY_START && h < WAKE_DAY_END
+    : h >= WAKE_DAY_START || h < WAKE_DAY_END;
+}
+// 此刻该用哪个空闲阈值。每次 tick 现算 —— 跨过 07:00 / 24:00 自动换档,不用重启。
+function wakeIdleMin() {
+  return WAKE_IDLE_MIN_FIXED || (isDaytime() ? WAKE_IDLE_MIN_DAY : WAKE_IDLE_MIN_NIGHT);
 }
 function wakeTurn(idleUserMin) {
   const now = bjNowStr();
@@ -736,8 +764,9 @@ function wakeTurn(idleUserMin) {
 function wakeTick(force) {
   if (busy || queue.length) return;
   const idleTurnMin = (Date.now() - lastTurnAt) / 60000;
-  if (!force && idleTurnMin < WAKE_IDLE_MIN) return;
-  log("[wake] idle", Math.round(idleTurnMin), "min", force ? "(forced)" : "");
+  const threshold = wakeIdleMin();
+  if (!force && idleTurnMin < threshold) return;
+  log("[wake] idle", Math.round(idleTurnMin), "min", `(阈值 ${threshold},${isDaytime() ? "白天" : "夜里"})`, force ? "(forced)" : "");
   wakeTurn((Date.now() - lastUserAt) / 60000);
 }
 setInterval(wakeTick, WAKE_CHECK_MIN * 60000);

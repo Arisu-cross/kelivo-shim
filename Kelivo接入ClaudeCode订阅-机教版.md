@@ -500,7 +500,10 @@ npx zeabur@latest deploy --create --name kelivo-shim   # 上传部署(交互选�
 | `PORT` | `8080` | |
 | `USER_NAME` / `AI_NAME` | 你们的名字 | |
 | `BARK_KEY` | (可选)Bark的key | 自主时间推送用,见 §7 |
-| `WAKE_IDLE_MIN` | `50` | 自主时间空闲阈值(分钟),略小于缓存TTL;`WAKE_CHECK_MIN` 为检查频率(默认10) |
+| `WAKE_IDLE_MIN` | (不设) | 自主时间空闲阈值(分钟),**不分昼夜的固定值**;设了就压过下面两档 |
+| `WAKE_IDLE_MIN_DAY` / `WAKE_IDLE_MIN_NIGHT` | `30` / `55` | 白天 / 夜里各自的空闲阈值。夜里那档别调过 60(缓存TTL) |
+| `WAKE_DAY_START` / `WAKE_DAY_END` | `7` / `24` | 白天是北京时间的哪一段(含起点、不含终点),可跨零点 |
+| `WAKE_CHECK_MIN` | `5` | 检查频率(轮询粒度)。真实间隔 = 阈值 + 最多一个这个值 |
 | `TG_BOT_TOKEN` | (可选)Telegram bot token | 启用 Telegram 前端:与 Kelivo 共用同一常驻进程,收发消息+自主发言直接进 TG 对话(bot 可主动开口,Kelivo 做不到)。@BotFather 创建 |
 | `TG_CHAT_ID` | (可选) | 预设 TG 会话;不设则第一个私聊自动锁定,之后只认这个人 |
 | `SOUL_ANCHOR` | (可选)覆盖默认会话定性锚点 | 对抗 claude -p 的助手腔/解离,代码已带默认值,见 §9 |
