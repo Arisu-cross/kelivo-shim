@@ -661,6 +661,8 @@ app.get("/debug", (_q, r) => r.json({
   // 查岗:⚠️ 这个 /debug 是裸奔的(手册 §9),所以这里**只报条数**。
   // App 名和时间在带钥匙的 /activity 里 —— 她的行踪不放在公网可读的口子上。
   report: { on: REPORT_ON, count: activity.length },
+  // 健康数据中转:on=false 表示没配 AW_KEY = 这个口子整个关着(2026-09-05 起默认如此)
+  aw: { on: AW_ON, count: awData.length },
   wake: {
     // prompt: 正文从哪来(env / 文件 / 内置默认)—— 「我改了文案怎么没变」第一眼看这里
     prompt: process.env.WAKE_PROMPT ? "env" : (fs.existsSync(WAKE_PROMPT_FILE) ? WAKE_PROMPT_FILE : "内置默认"),
@@ -1294,13 +1296,25 @@ if (TG_TOKEN) tgPoll();
 // ---- Apple Watch 健康数据中转 --------------------------------------------------
 // 手机快捷指令 POST 任意 JSON 到 /aw?key=<AW_KEY>;AI 用 WebFetch GET 同一地址读。
 // 内存保存 48h / 最多 300 条,重启即清(实时数据,不当存储)。
-const AW_KEY = process.env.AW_KEY || SHIM_KEY;
+//
+// ⚠️ 2026-09-05 改成「默认关」,两处都变了(改回去之前先读完这段):
+// ① **不再回落 SHIM_KEY**。原来写的是 `process.env.AW_KEY || SHIM_KEY`,
+//    于是没单独设 AW_KEY 的部署里,这个小功能的钥匙**就是主 API key** ——
+//    而这条网址是要写进 AI 的提示词、贴进手机快捷指令、到处传的。
+//    小功能泄露一把钥匙,不该等于把整个 shim 送出去。
+// ② **不设 AW_KEY = 整套关闭**(接口 503),而不是「谁都能读」。
+//    原来的 `!AW_KEY ||` 是「没配钥匙就放行」—— 一个公网可读的健康数据接口。
+//    这里照抄下面 /report 的范式:钥匙即开关,没钥匙就没这个功能。
+const AW_KEY = process.env.AW_KEY || "";
+const AW_ON = !!AW_KEY;
 let awData = [];
 function awAuth(req) {
   const k = req.query.key || req.get("x-api-key") || "";
-  return !AW_KEY || k === AW_KEY;
+  return AW_ON && k === AW_KEY;
 }
+const awOff = (res) => res.status(503).json({ ok: false, error: "aw disabled (no AW_KEY)" });
 app.post("/aw", (req, res) => {
+  if (!AW_ON) return awOff(res);
   if (!awAuth(req)) return res.status(401).json({ ok: false });
   awData.push({ t: new Date().toISOString(), data: req.body });
   const cut = Date.now() - 48 * 3600e3;
@@ -1309,6 +1323,7 @@ app.post("/aw", (req, res) => {
   res.json({ ok: true, count: awData.length });
 });
 app.get("/aw", (req, res) => {
+  if (!AW_ON) return awOff(res);
   if (!awAuth(req)) return res.status(401).json({ ok: false });
   // 去掉空字段/空条目(快捷指令调试期的垃圾推送),只给最近 12 条,免得 AI 读一大坨
   const cleaned = awData
