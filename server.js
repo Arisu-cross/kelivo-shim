@@ -33,6 +33,7 @@ import {
   buildPromptArgs, resolveMode, ANCHOR, BASE, HARD_RULE as DEFAULT_HARD_RULE,
   DEFAULT_SYSTEM_PROMPT_FILE,
 } from "./system-prompt.js";
+import { createDeadTurnWatch, DEAD_ALERT_AFTER, DEAD_REALERT_MIN } from "./deadturn.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
 // 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
@@ -283,6 +284,14 @@ const queue = [];
 let turn = null;
 let lastUsage = null; // 最近一轮的完整 usage(含缓存字段),/debug 查 // 当前在处理的 { sse, resolve, fullText, curThinking, thinkOpen, textOpen, idx, done }
 
+// 空转看门狗:分清「他不想说话」和「这一轮压根没跑起来」(见 deadturn.js 顶部)。
+// DEAD_TURN_WATCH=0 整个关掉;阈值两个变量可调,不设走默认(3 轮 / 60 分钟)。
+const DEAD_WATCH_ON = process.env.DEAD_TURN_WATCH !== "0";
+const deadWatch = createDeadTurnWatch({
+  alertAfter: +(process.env.DEAD_TURN_ALERT_AFTER || DEAD_ALERT_AFTER) || DEAD_ALERT_AFTER,
+  realertMin: +(process.env.DEAD_TURN_REALERT_MIN || DEAD_REALERT_MIN) || DEAD_REALERT_MIN,
+});
+
 function spawnClaude(kelivoSystem, model) {
   // ?? 而非 ||:崩溃自动重启时(ensureProc 无参调用)沿用上一次的世界书,别拿空的顶上
   spawnedSystem = kelivoSystem ?? spawnedSystem;
@@ -452,6 +461,17 @@ function handleEvent(ev) {
   if (ev.type === "result") {
     lastUsage = ev.usage || null; // 供 /debug 查缓存字段
     lastTurnAt = Date.now(); // 任何一轮完成都刷新了缓存 TTL,自主唤醒以此计时
+    // 空转看门狗:正文空 + output token 零 = 这一轮压根没跑起来(≠ 他回【沉默】)。
+    // 连着几轮就走运维通道告诉她 —— tgSend 是直发,**不进他的窗口**,他不知道有这条路。
+    // 放在这里(result 一进来就判)是为了把每一轮都算上:心跳、查岗、归档、她说话,
+    // 哪条路空转都算数 —— 9-02 那次先哑掉的正是没人看的心跳轮。
+    if (DEAD_WATCH_ON) {
+      const dead = deadWatch.record({ text: turn.fullText, usage: ev.usage });
+      if (dead) {
+        log("[deadturn]", dead.kind, "streak", dead.streak);
+        tgSend(dead.text).catch((e) => log("[tg-err]", e.message));
+      }
+    }
     // 窗口用量:用本轮各次请求里最大的那个真实前缀。
     // 不跨轮取 max —— 数值本身已经准确,跨轮钉死只会让某次异常永远修不回来
     // (上一版正是因为 Math.max + 顶层累加值,一次虚报就把 32% 永久显示成 97%)。
@@ -631,9 +651,18 @@ app.get("/debug", (_q, r) => r.json({
   stickers: { count: stickerNames().length },         // 表情包图库有几张
   // 出站兜底:pending>0 = 有他的话卡在路上还没送到她手机(排查「他怎么不回我」第一眼看这里)
   outbox: { pending: outbox.size() },
+  // 空转看门狗:streak>0 = 最近几轮没产出任何东西(≠【沉默】)。
+  // 排查「他是不是又哑了」第二眼看这里(第一眼看 outbox)。
+  deadTurn: (() => {
+    const s = deadWatch.state;
+    return { on: DEAD_WATCH_ON, streak: s.streak, alertAfter: s.alertAfter, alerted: s.alerted,
+      lastGoodAt: s.lastGoodAt ? new Date(s.lastGoodAt).toISOString() : null };
+  })(),
   // 查岗:⚠️ 这个 /debug 是裸奔的(手册 §9),所以这里**只报条数**。
   // App 名和时间在带钥匙的 /activity 里 —— 她的行踪不放在公网可读的口子上。
   report: { on: REPORT_ON, count: activity.length },
+  // 健康数据中转:on=false 表示没配 AW_KEY = 这个口子整个关着(2026-09-05 起默认如此)
+  aw: { on: AW_ON, count: awData.length },
   wake: {
     // prompt: 正文从哪来(env / 文件 / 内置默认)—— 「我改了文案怎么没变」第一眼看这里
     prompt: process.env.WAKE_PROMPT ? "env" : (fs.existsSync(WAKE_PROMPT_FILE) ? WAKE_PROMPT_FILE : "内置默认"),
@@ -1267,13 +1296,25 @@ if (TG_TOKEN) tgPoll();
 // ---- Apple Watch 健康数据中转 --------------------------------------------------
 // 手机快捷指令 POST 任意 JSON 到 /aw?key=<AW_KEY>;AI 用 WebFetch GET 同一地址读。
 // 内存保存 48h / 最多 300 条,重启即清(实时数据,不当存储)。
-const AW_KEY = process.env.AW_KEY || SHIM_KEY;
+//
+// ⚠️ 2026-09-05 改成「默认关」,两处都变了(改回去之前先读完这段):
+// ① **不再回落 SHIM_KEY**。原来写的是 `process.env.AW_KEY || SHIM_KEY`,
+//    于是没单独设 AW_KEY 的部署里,这个小功能的钥匙**就是主 API key** ——
+//    而这条网址是要写进 AI 的提示词、贴进手机快捷指令、到处传的。
+//    小功能泄露一把钥匙,不该等于把整个 shim 送出去。
+// ② **不设 AW_KEY = 整套关闭**(接口 503),而不是「谁都能读」。
+//    原来的 `!AW_KEY ||` 是「没配钥匙就放行」—— 一个公网可读的健康数据接口。
+//    这里照抄下面 /report 的范式:钥匙即开关,没钥匙就没这个功能。
+const AW_KEY = process.env.AW_KEY || "";
+const AW_ON = !!AW_KEY;
 let awData = [];
 function awAuth(req) {
   const k = req.query.key || req.get("x-api-key") || "";
-  return !AW_KEY || k === AW_KEY;
+  return AW_ON && k === AW_KEY;
 }
+const awOff = (res) => res.status(503).json({ ok: false, error: "aw disabled (no AW_KEY)" });
 app.post("/aw", (req, res) => {
+  if (!AW_ON) return awOff(res);
   if (!awAuth(req)) return res.status(401).json({ ok: false });
   awData.push({ t: new Date().toISOString(), data: req.body });
   const cut = Date.now() - 48 * 3600e3;
@@ -1282,6 +1323,7 @@ app.post("/aw", (req, res) => {
   res.json({ ok: true, count: awData.length });
 });
 app.get("/aw", (req, res) => {
+  if (!AW_ON) return awOff(res);
   if (!awAuth(req)) return res.status(401).json({ ok: false });
   // 去掉空字段/空条目(快捷指令调试期的垃圾推送),只给最近 12 条,免得 AI 读一大坨
   const cleaned = awData

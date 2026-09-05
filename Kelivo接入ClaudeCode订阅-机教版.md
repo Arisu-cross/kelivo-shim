@@ -363,10 +363,14 @@ app.post("/hb", (req, res) => {  // 手动触发测试口
 });
 
 // ---- 健康数据中转(可选,配 iOS 快捷指令) ----
-const AW_KEY = process.env.AW_KEY || SHIM_KEY;
+// ⚠️ 钥匙即开关:不设 AW_KEY = 这个口子整个关掉(503),**不回落 SHIM_KEY**。
+// 回落等于让这个小功能用上主 API key,而这条网址是要写进提示词、贴进快捷指令的。
+const AW_KEY = process.env.AW_KEY || "";
+const AW_ON = !!AW_KEY;
 let awData = [];
-function awAuth(req) { const k = req.query.key || req.get("x-api-key") || ""; return !AW_KEY || k === AW_KEY; }
+function awAuth(req) { const k = req.query.key || req.get("x-api-key") || ""; return AW_ON && k === AW_KEY; }
 app.post("/aw", (req, res) => {
+  if (!AW_ON) return res.status(503).json({ ok: false, error: "aw disabled (no AW_KEY)" });
   if (!awAuth(req)) return res.status(401).json({ ok: false });
   awData.push({ t: new Date().toISOString(), data: req.body });
   const cut = Date.now() - 48 * 3600e3;
@@ -504,6 +508,10 @@ npx zeabur@latest deploy --create --name kelivo-shim   # 上传部署(交互选�
 | `WAKE_IDLE_MIN_DAY` / `WAKE_IDLE_MIN_NIGHT` | `30` / `55` | 白天 / 夜里各自的空闲阈值。夜里那档别调过 60(缓存TTL) |
 | `WAKE_DAY_START` / `WAKE_DAY_END` | `7` / `24` | 白天是北京时间的哪一段(含起点、不含终点),可跨零点 |
 | `WAKE_CHECK_MIN` | `5` | 检查频率(轮询粒度)。真实间隔 = 阈值 + 最多一个这个值 |
+| `AW_KEY` | (不设=关) | 健康数据中转 `/aw` 的钥匙。**钥匙即开关**:不设 = 这个口子整个关闭(503)。⚠️ 2026-09-05 前它会**回落成 `SHIM_KEY`** —— 那等于让一个要写进提示词、贴进手机快捷指令的小功能用上主 API key,已改掉。想用就单独给它一把 |
+| `DEAD_TURN_WATCH` | `1`(默认开) | **空转看门狗**:一轮跑完既没有正文、`output_tokens` 又是零 = 这一轮压根没跑起来(≠ AI 选择不说话,那是有 token 的)。连着几轮就发 Telegram 告诉你,**走运维通道直发,不进 AI 的窗口**。上游代理把 401 伪装成合法空响应时,这是唯一看得见的信号。`0` 关闭 |
+| `DEAD_TURN_ALERT_AFTER` | `3` | 连着几轮空转才告警。单轮空转可能是上游抖一下,连着三轮一定有事 |
+| `DEAD_TURN_REALERT_MIN` | `60` | 同一段故障隔多少分钟才重复提醒一次(防刷屏) |
 | `TG_BOT_TOKEN` | (可选)Telegram bot token | 启用 Telegram 前端:与 Kelivo 共用同一常驻进程,收发消息+自主发言直接进 TG 对话(bot 可主动开口,Kelivo 做不到)。@BotFather 创建 |
 | `TG_CHAT_ID` | (可选) | 预设 TG 会话;不设则第一个私聊自动锁定,之后只认这个人 |
 | `SOUL_ANCHOR` | (可选)覆盖默认会话定性锚点 | 对抗 claude -p 的助手腔/解离,代码已带默认值,见 §9 |
