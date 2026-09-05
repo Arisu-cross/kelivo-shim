@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { detectControl } from "../hands.js";
 
-// 「停」是三层刹车的第二层:她越过沈渡直接叫停。
+// 「停」是三层刹车的第二层:使用者越过 AI 直接叫停。
 // 这层最怕两件事:该停的时候没停(漏判)、聊着天突然把活掐了(误判)。
 // 下面两组用例就是钉这两件事的。
 
