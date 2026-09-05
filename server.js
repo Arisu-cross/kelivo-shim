@@ -33,6 +33,7 @@ import {
   buildPromptArgs, resolveMode, ANCHOR, BASE, HARD_RULE as DEFAULT_HARD_RULE,
   DEFAULT_SYSTEM_PROMPT_FILE,
 } from "./system-prompt.js";
+import { createDeadTurnWatch, DEAD_ALERT_AFTER, DEAD_REALERT_MIN } from "./deadturn.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
 // 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
@@ -283,6 +284,14 @@ const queue = [];
 let turn = null;
 let lastUsage = null; // 最近一轮的完整 usage(含缓存字段),/debug 查 // 当前在处理的 { sse, resolve, fullText, curThinking, thinkOpen, textOpen, idx, done }
 
+// 空转看门狗:分清「他不想说话」和「这一轮压根没跑起来」(见 deadturn.js 顶部)。
+// DEAD_TURN_WATCH=0 整个关掉;阈值两个变量可调,不设走默认(3 轮 / 60 分钟)。
+const DEAD_WATCH_ON = process.env.DEAD_TURN_WATCH !== "0";
+const deadWatch = createDeadTurnWatch({
+  alertAfter: +(process.env.DEAD_TURN_ALERT_AFTER || DEAD_ALERT_AFTER) || DEAD_ALERT_AFTER,
+  realertMin: +(process.env.DEAD_TURN_REALERT_MIN || DEAD_REALERT_MIN) || DEAD_REALERT_MIN,
+});
+
 function spawnClaude(kelivoSystem, model) {
   // ?? 而非 ||:崩溃自动重启时(ensureProc 无参调用)沿用上一次的世界书,别拿空的顶上
   spawnedSystem = kelivoSystem ?? spawnedSystem;
@@ -452,6 +461,17 @@ function handleEvent(ev) {
   if (ev.type === "result") {
     lastUsage = ev.usage || null; // 供 /debug 查缓存字段
     lastTurnAt = Date.now(); // 任何一轮完成都刷新了缓存 TTL,自主唤醒以此计时
+    // 空转看门狗:正文空 + output token 零 = 这一轮压根没跑起来(≠ 他回【沉默】)。
+    // 连着几轮就走运维通道告诉她 —— tgSend 是直发,**不进他的窗口**,他不知道有这条路。
+    // 放在这里(result 一进来就判)是为了把每一轮都算上:心跳、查岗、归档、她说话,
+    // 哪条路空转都算数 —— 9-02 那次先哑掉的正是没人看的心跳轮。
+    if (DEAD_WATCH_ON) {
+      const dead = deadWatch.record({ text: turn.fullText, usage: ev.usage });
+      if (dead) {
+        log("[deadturn]", dead.kind, "streak", dead.streak);
+        tgSend(dead.text).catch((e) => log("[tg-err]", e.message));
+      }
+    }
     // 窗口用量:用本轮各次请求里最大的那个真实前缀。
     // 不跨轮取 max —— 数值本身已经准确,跨轮钉死只会让某次异常永远修不回来
     // (上一版正是因为 Math.max + 顶层累加值,一次虚报就把 32% 永久显示成 97%)。
@@ -631,6 +651,13 @@ app.get("/debug", (_q, r) => r.json({
   stickers: { count: stickerNames().length },         // 表情包图库有几张
   // 出站兜底:pending>0 = 有他的话卡在路上还没送到她手机(排查「他怎么不回我」第一眼看这里)
   outbox: { pending: outbox.size() },
+  // 空转看门狗:streak>0 = 最近几轮没产出任何东西(≠【沉默】)。
+  // 排查「他是不是又哑了」第二眼看这里(第一眼看 outbox)。
+  deadTurn: (() => {
+    const s = deadWatch.state;
+    return { on: DEAD_WATCH_ON, streak: s.streak, alertAfter: s.alertAfter, alerted: s.alerted,
+      lastGoodAt: s.lastGoodAt ? new Date(s.lastGoodAt).toISOString() : null };
+  })(),
   // 查岗:⚠️ 这个 /debug 是裸奔的(手册 §9),所以这里**只报条数**。
   // App 名和时间在带钥匙的 /activity 里 —— 她的行踪不放在公网可读的口子上。
   report: { on: REPORT_ON, count: activity.length },

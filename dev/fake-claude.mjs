@@ -11,6 +11,8 @@
 //   含 "ARCHIVE_FAIL"    → 演归档失败(tool_result 不带 🗄️)
 //   含 "COMPACT_NOW"     → 先发一个 compact_boundary,再正常回一轮
 //   含 "CHECK_NOW"      → 回复里写一个 [查岗](演他想看一眼她手机上的动静)
+//   含 "DEAD_NOW"       → 演 2026-09-02 那种空转:一个字不吐、output_tokens 零,
+//                        但 subtype 照样是 success(代理把 401 伪装成合法空响应的原样)
 //   含 "【系统·查岗】"   → 这是查岗结果那一轮:**故意再写一次 [查岗]**,用来钉死防打转;
 //                        回什么由 FAKE_LOOKUP_REPLY 决定(默认写标记,设成「【沉默】」演他不打扰)
 // 另外 FAKE_PREFIX 环境变量决定 message_start 报的窗口前缀大小。
@@ -63,6 +65,12 @@ function reply(text) {
     out({ type: "system", subtype: "compact_boundary", compact_metadata: { trigger: "auto", pre_tokens: 160000 } });
   }
   out({ type: "stream_event", event: { type: "message_start", message: { usage: { input_tokens: 3, cache_read_input_tokens: PREFIX } } } });
+
+  // 空转:正文一个字没有、usage 全零,subtype 仍是 success —— 9-02 那次三层都没报错的原样。
+  if (text.includes("DEAD_NOW") && !isReplay) {
+    out({ type: "result", subtype: "success", usage: { input_tokens: 0, output_tokens: 0 } });
+    return;
+  }
 
   const wantArchive = text.includes("archive_session");
   const wantFail = text.includes("ARCHIVE_FAIL");
