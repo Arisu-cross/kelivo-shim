@@ -1407,16 +1407,15 @@ app.get("/aw", (req, res) => {
 // ⚠️ 「停」停的是**活**,不是**他**:绝不 kill claude 进程 ——
 // 那等于换窗口 = 丢掉这一窗还没归档的记忆(手册 §8 两次事故都是这么来的)。
 // 只做两件事:把 shim 这边还没喂进去的队列清掉 + 让工作台杀掉它的子进程。
-async function handsControl(text) {
-  if (!handsReady()) return false;
+// 算出该回她什么。返回 null = 这句话不是控制指令,照常进他窗口。
+// ⚠️ 抽成「算」和「送」两半,是因为两个前端送法不一样(TG 走 sendMessage,
+// Kelivo 走 SSE),而**急停这种事不该只有一个前端有** —— 她在哪说都得管用。
+async function handsControlText(text) {
+  if (!handsReady()) return null;
   const kind = detectControl(text);
-  if (!kind) return false;
+  if (!kind) return null;
 
-  if (kind === "status") {
-    const t = await listJobs();
-    if (t) await tgSend(t).catch((e) => log("[tg-err]", e.message));
-    return true;
-  }
+  if (kind === "status") return (await listJobs()) || null;
 
   // 急停
   const dropped = queue.length;
@@ -1426,7 +1425,14 @@ async function handsControl(text) {
   const lines = [r.text];
   if (dropped) lines.push(`还有 ${dropped} 条没送到他那儿的消息,也一并撤了。`);
   if (busy) lines.push("他手上这一轮我没打断——打断等于换窗口,那会丢记忆。等他说完就停了。");
-  await tgSend(lines.filter(Boolean).join("\n")).catch((e) => log("[tg-err]", e.message));
+  return lines.filter(Boolean).join("\n") || null;
+}
+
+// Telegram 入口:直接发一条消息给她。
+async function handsControl(text) {
+  const t = await handsControlText(text);
+  if (t === null) return false;
+  if (t) await tgSend(t).catch((e) => log("[tg-err]", e.message));
   return true;
 }
 
@@ -1644,7 +1650,18 @@ function handleMessages(req, res) {
   // Kelivo 选的模型;不在名单里(或没传)就沿用当前模型
   const model = MODELS.includes(body.model) ? body.model : spawnedModel;
   const sse = stream ? makeSSE(res) : makeCollector(res);
-  submitTurn(text, images, sse, { system, model, src: "kelivo" });
+  // 急停 / 看活儿:Kelivo 这边同样管用。⚠️ 这条别删 —— 她在哪个前端说「停」都该停,
+  // 一个安全阀只有一半入口有,等于没有。
+  (async () => {
+    const ctl = images.length ? null : await handsControlText(text);
+    if (ctl === null) return submitTurn(text, images, sse, { system, model, src: "kelivo" });
+    log("[hands] Kelivo 侧控制指令");
+    sse.text(ctl);
+    sse.finish(undefined, ctl);
+  })().catch((e) => {
+    log("[hands-ctl-err]", e.message);
+    submitTurn(text, images, sse, { system, model, src: "kelivo" });   // 出岔子就当普通消息,绝不吞
+  });
 }
 
 // Kelivo 的 Claude 类型 Base URL 填 /v1 会拼成 /v1/messages;填根则是 /messages。两个都接。
