@@ -13,6 +13,31 @@ const TOKEN = () => process.env.HANDS_TOKEN || "";
 
 export const handsReady = () => !!URL_();
 
+/** 从工作台把一个文件取回来(shim 要转发到 Telegram)。返回 {buf, name} 或抛错。 */
+export async function fetchFile(relPath) {
+  if (!handsReady()) throw new Error("没接工作台");
+  const r = await fetch(`${URL_()}/file?path=${encodeURIComponent(relPath)}`, {
+    headers: { "x-token": TOKEN() },
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!r.ok) throw new Error(`工作台取文件失败 ${r.status}`);
+  return Buffer.from(await r.arrayBuffer());
+}
+
+/** 把她发来的文件存进工作台的收件夹。返回工作台给的相对路径。 */
+export async function uploadFile(name, buf) {
+  if (!handsReady()) throw new Error("没接工作台");
+  const r = await fetch(`${URL_()}/upload?name=${encodeURIComponent(name)}`, {
+    method: "POST",
+    headers: { "x-token": TOKEN(), "content-type": "application/octet-stream" },
+    body: buf,
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!r.ok) throw new Error(`工作台存文件失败 ${r.status}`);
+  const j = await r.json();
+  return j.path;
+}
+
 async function call(path, { method = "GET", timeoutMs = 10000 } = {}) {
   if (!handsReady()) return { ok: false, off: true };
   try {
