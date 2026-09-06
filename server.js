@@ -25,7 +25,7 @@ import {
   DEFAULT_MAX_BLOCKS, DEFAULT_REPLAY_MAX_CHARS,
 } from "./compact-gate.js";
 import { Outbox, sendWithRetry, shouldRetry } from "./tg-outbox.js";
-import { handsReady, stopAll, listJobs, detectControl } from "./hands.js";
+import { handsReady, stopAll, listJobs, detectControl, fetchFile, uploadFile } from "./hands.js";
 import {
   normalizeAppName, pushActivity, summarizeActivity,
   takeCheckMarker, lookupPrompt, isSilentReply,
@@ -990,6 +990,19 @@ async function tgSendVoice(ogg) {
   if (!j.ok) throw new Error(`sendVoice: ${JSON.stringify(j).slice(0, 200)}`);
 }
 
+// 把一个文件作为 Telegram 文件消息发给她。用 sendDocument 而不是 sendPhoto/sendAudio:
+// 文件消息她能点开、能存进「文件」、能转发,而且不挑类型。
+async function tgSendDocument(buf, filename, caption) {
+  const fd = new FormData();
+  fd.append("chat_id", String(tgChatId));
+  fd.append("document", new Blob([buf]), filename);
+  if (caption) fd.append("caption", caption.slice(0, 1000));   // TG 的 caption 上限 1024
+  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendDocument`,
+    { method: "POST", body: fd, signal: AbortSignal.timeout(120000) });
+  const j = await r.json();
+  if (!j.ok) throw new Error(`sendDocument: ${JSON.stringify(j).slice(0, 200)}`);
+}
+
 // ---- 表情包:回复里的 [贴纸:名字] 发成原生贴纸 --------------------------------
 // 图库是私人内容,不进这个仓库:注册表与图都在持久卷上,没配就整个功能静默关闭
 // (标记会原样显示成文字,聊天不受影响)。
@@ -1132,6 +1145,20 @@ const EARS_URL = (process.env.EARS_URL || "").replace(/\/+$/, "");
 const EARS_TOKEN = process.env.EARS_TOKEN || "";
 const earsReady = () => !!EARS_URL;
 
+// 她发来的文件(document)。⚠️ Telegram 的 bot 下载上限是 20MB,超了 getFile 直接失败,
+// 所以先看 file_size 再决定要不要下,免得白等一趟再报错。
+const TG_DOC_MAX = +(process.env.TG_DOC_MAX_BYTES || 20 * 1024 * 1024);
+async function tgFetchDocument(m) {
+  const d = m.document || {};
+  if (!d.file_id) return null;
+  if (d.file_size && d.file_size > TG_DOC_MAX) return { tooBig: true, name: d.file_name, size: d.file_size };
+  const gf = await tgApi("getFile", { file_id: d.file_id });
+  if (!gf.ok) return null;
+  const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${gf.result.file_path}`,
+    { signal: AbortSignal.timeout(120000) });
+  return { buf: Buffer.from(await r.arrayBuffer()), name: d.file_name || "文件" };
+}
+
 async function tgFetchVoice(m) {
   const v = m.voice || m.audio || {};
   if (!v.file_id) return null;
@@ -1250,6 +1277,31 @@ async function handleTgMessage(m) {
       } catch (e) {
         log("[ears-err]", e.message);
         note = "(她发来一条语音,但这次没听清)";   // 降级:宁可少信息,不丢消息
+      }
+    }
+    text = text ? `${text}\n${note}` : note;
+  }
+  // 她发来一个文件:存进工作台的收件夹,只把「有这么个文件、在哪」告诉他。
+  // ⚠️ 文件内容不进窗口 —— 一份 PDF 塞进上下文等于把窗口烧掉;要看内容让他自己去读。
+  if (m.document) {
+    let note;
+    if (!handsReady()) {
+      note = `(她发来一个文件「${m.document.file_name || "文件"}」,但工作台没接上,我拿不到)`;
+    } else {
+      try {
+        const got = await tgFetchDocument(m);
+        if (!got) note = "(她发来一个文件,但没能取到)";
+        else if (got.tooBig)
+          note = `(她发来一个文件「${got.name}」,${(got.size / 1048576).toFixed(1)}MB —— 超过 Telegram 的 20MB 下载上限,我拿不到)`;
+        else {
+          const rel = await uploadFile(got.name, got.buf);
+          note = `(她发来一个文件,已经放进工作台了:${rel},${(got.buf.length / 1024).toFixed(0)}KB。` +
+                 `要看内容就用 read_file,要动手就派活。)`;
+          log("[tg-doc] 已转存", rel, got.buf.length, "字节");
+        }
+      } catch (e) {
+        log("[tg-doc-err]", e.message);
+        note = "(她发来一个文件,但这次没存进工作台)";   // 降级:消息本身绝不丢
       }
     }
     text = text ? `${text}\n${note}` : note;
@@ -1390,6 +1442,28 @@ app.post("/job-done", (req, res) => {
   log("[job-done]", j.id, j.status);
   queueJobResult(j);
   res.json({ ok: true });
+});
+
+// 工作台把成品发给她:他调 send_to_her → 工作台只告诉这里「是哪个文件」→
+// 这里回头去工作台取内容 → 发 Telegram 文件消息。
+// ⚠️ 文件不进他的窗口,只走管道 —— 一份 PDF 塞进上下文等于把窗口烧掉。
+app.post("/send-file", async (req, res) => {
+  if (!HANDS_CB_TOKEN) return res.status(503).json({ ok: false, error: "HANDS_CALLBACK_TOKEN 未配置" });
+  const k = req.get("x-api-key") || (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
+  if (k !== HANDS_CB_TOKEN) { log("[send-file] 401"); return res.status(401).json({ ok: false }); }
+  const rel = (req.body && req.body.path) || "";
+  if (!rel) return res.status(400).json({ ok: false, error: "没说发哪个文件" });
+  if (!tgChatId) return res.status(503).json({ ok: false, error: "Telegram 还没锁定聊天" });
+  try {
+    const buf = await fetchFile(rel);
+    const name = rel.split("/").pop() || "文件";
+    await tgSendDocument(buf, name, req.body.caption || "");
+    log("[send-file] 已发出", name, buf.length, "字节");
+    res.json({ ok: true, bytes: buf.length });
+  } catch (e) {
+    log("[send-file-err]", e.message);
+    res.status(502).json({ ok: false, error: e.message });
+  }
 });
 
 // 和查岗轮同款:kind=job 让这一轮不算「她出现了」——lastUserAt 不动、不过 detectReset、
