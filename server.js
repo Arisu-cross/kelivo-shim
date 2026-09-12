@@ -35,6 +35,7 @@ import {
   DEFAULT_SYSTEM_PROMPT_FILE,
 } from "./system-prompt.js";
 import { createDeadTurnWatch, DEAD_ALERT_AFTER, DEAD_REALERT_MIN } from "./deadturn.js";
+import { buildAuthEnv, authMode } from "./auth-env.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
 // 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
@@ -332,8 +333,10 @@ function spawnClaude(kelivoSystem, model) {
   windowTokens = 0; windowWarned = false; windowAutoArchived = false; compactions = 0; lastCompactAt = null; lastCompactPre = 0;
   dirty = false; compactBlocks = 0; archiveAttempts = 0; transcript = [];
   if (carry) { log("[replay] 换窗时还有未归档内容,接进新窗口补档"); setTimeout(() => replayTurn(carry), 0); }
-  const env = { ...process.env };
-  delete env.ANTHROPIC_API_KEY;
+  // 上游凭据:设了长期令牌就直连订阅,否则照旧经 CPA 中转。
+  // ⚠️ 直连必须连 ANTHROPIC_AUTH_TOKEN/BASE_URL 一起摘 —— 它们优先级更高,
+  //    不摘就会静默压过长期令牌(理由与实测见 auth-env.js 顶部)。
+  const env = buildAuthEnv(process.env);
   const p = spawn(CLAUDE_BIN, args, { cwd: process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] });
   p.stdout.on("data", onStdout);
   p.stderr.on("data", (d) => log("[claude]", d.toString().slice(0, 300)));
@@ -343,7 +346,8 @@ function spawnClaude(kelivoSystem, model) {
     if (turn && !turn.done) { try { turn.sse?.finish(); } catch {} turn = null; }
     setTimeout(ensureProc, 1500);
   });
-  log("[claude] spawned", spawnedModel, "sysLen", spawnedSystem.length, "prompt", promptMode);
+  log("[claude] spawned", spawnedModel, "sysLen", spawnedSystem.length, "prompt", promptMode,
+      "auth", authMode(process.env));
   return p;
 }
 function ensureProc(kelivoSystem, model) { if (!proc) proc = spawnClaude(kelivoSystem, model); }
@@ -622,7 +626,9 @@ function extractImages(messages) {
 
 const app = express();
 app.use(express.json({ limit: "100mb" }));
-app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length }));
+// auth 只报 "direct"/"proxy" 两个字,不泄露任何值 —— 有了它,
+// 切换之后不用进容器就能确认到底换没换路(exec 会进他活着的那个容器,能少进就少进)。
+app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length, auth: authMode(process.env) }));
 app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
   // 系统提示词:append=CC 默认那份还在(锚点压着);replace=已整段换掉(前缀少约 4800 token)
