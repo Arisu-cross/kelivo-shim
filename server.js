@@ -36,6 +36,7 @@ import {
 } from "./system-prompt.js";
 import { createDeadTurnWatch, DEAD_ALERT_AFTER, DEAD_REALERT_MIN } from "./deadturn.js";
 import { buildAuthEnv, authMode } from "./auth-env.js";
+import { pickCliBin, parseModelList } from "./cli-bin.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
 // 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
@@ -67,6 +68,10 @@ const EFFORT_OVERRIDES = Object.fromEntries(
 );
 const effortFor = (model) => EFFORT_OVERRIDES[model] || EFFORT;
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
+// 第二份(新版)CLI,只给 NEXT_CLI_MODELS 点名的模型用;其余模型照旧走 CLAUDE_BIN。见 cli-bin.js
+const CLAUDE_BIN_NEXT = process.env.CLAUDE_BIN_NEXT || "";
+const NEXT_CLI_MODELS = parseModelList(process.env.NEXT_CLI_MODELS ?? "claude-opus-5-5");
+const binFor = (model) => pickCliBin(model, { bin: CLAUDE_BIN, nextBin: CLAUDE_BIN_NEXT, nextModels: NEXT_CLI_MODELS });
 const MCP_CONFIG = process.env.MCP_CONFIG || ".mcp.json";
 const FORWARD_THINKING = process.env.FORWARD_THINKING !== "0";
 const AI_NAME = process.env.AI_NAME || "TA"; // 你的 AI 的名字(Bark 推送标题、模型显示名)
@@ -92,17 +97,20 @@ const SYSTEM_PROMPT_FILE = process.env.SYSTEM_PROMPT_FILE ?? DEFAULT_SYSTEM_PROM
 // 参数不认识的话子进程直接退出,那就是他彻底失联,比少一次改动严重得多。
 // 同步执行、只跑一次(第一次 spawn 时),而且只在 replace 模式下跑:阻塞一两秒换一个
 // 起不来的保证,划算。append 模式(默认)完全不会走到这里。
-let replaceSupported = null;
-function cliSupportsReplace() {
-  if (replaceSupported !== null) return replaceSupported;
+// 两份 CLI 各探各的(按可执行文件路径缓存)
+const replaceSupported = new Map();
+function cliSupportsReplace(bin = CLAUDE_BIN) {
+  if (replaceSupported.has(bin)) return replaceSupported.get(bin);
+  let ok;
   try {
-    const out = execFileSync(CLAUDE_BIN, ["--help"], { encoding: "utf8", timeout: 30000 });
-    replaceSupported = /--system-prompt[ <]/.test(out);
+    const out = execFileSync(bin, ["--help"], { encoding: "utf8", timeout: 30000 });
+    ok = /--system-prompt[ <]/.test(out);
   } catch (e) {
     log("[sysprompt] 探测 --system-prompt 失败,按不支持处理:", e.message);
-    replaceSupported = false;
+    ok = false;
   }
-  return replaceSupported;
+  replaceSupported.set(bin, ok);
+  return ok;
 }
 
 // 省 token:--tools 只装真用的内置工具(Bash/Edit/Task 等大 schema 全砍,基线立减);
@@ -298,12 +306,13 @@ function spawnClaude(kelivoSystem, model) {
   // ?? 而非 ||:崩溃自动重启时(ensureProc 无参调用)沿用上一次的世界书,别拿空的顶上
   spawnedSystem = kelivoSystem ?? spawnedSystem;
   spawnedModel = model || spawnedModel || MODEL;
+  const bin = binFor(spawnedModel);
   const prompt = buildPromptArgs({
     mode: SYSTEM_PROMPT_MODE,
     worldbook: spawnedSystem,
     promptFile: SYSTEM_PROMPT_MODE === "replace" ? SYSTEM_PROMPT_FILE : "",
     fileExists: (f) => { try { return fs.existsSync(f); } catch { return false; } },
-    cliSupportsReplace: SYSTEM_PROMPT_MODE === "replace" ? cliSupportsReplace() : true,
+    cliSupportsReplace: SYSTEM_PROMPT_MODE === "replace" ? cliSupportsReplace(bin) : true,
     anchor: SOUL_ANCHOR, base: SYSTEM_PROMPT, hardRule: HARD_RULE,
   });
   promptMode = prompt.mode;
@@ -337,7 +346,7 @@ function spawnClaude(kelivoSystem, model) {
   // ⚠️ 直连必须连 ANTHROPIC_AUTH_TOKEN/BASE_URL 一起摘 —— 它们优先级更高,
   //    不摘就会静默压过长期令牌(理由与实测见 auth-env.js 顶部)。
   const env = buildAuthEnv(process.env);
-  const p = spawn(CLAUDE_BIN, args, { cwd: process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] });
+  const p = spawn(bin, args, { cwd: process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] });
   p.stdout.on("data", onStdout);
   p.stderr.on("data", (d) => log("[claude]", d.toString().slice(0, 300)));
   p.on("close", (code) => {
@@ -346,7 +355,7 @@ function spawnClaude(kelivoSystem, model) {
     if (turn && !turn.done) { try { turn.sse?.finish(); } catch {} turn = null; }
     setTimeout(ensureProc, 1500);
   });
-  log("[claude] spawned", spawnedModel, "sysLen", spawnedSystem.length, "prompt", promptMode,
+  log("[claude] spawned", spawnedModel, "cli", bin === CLAUDE_BIN ? "main" : "next", "sysLen", spawnedSystem.length, "prompt", promptMode,
       "auth", authMode(process.env));
   return p;
 }

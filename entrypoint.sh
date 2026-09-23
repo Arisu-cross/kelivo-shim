@@ -16,6 +16,20 @@ for i in 1 2 3 4 5; do
 done
 "$CLAUDE_BIN" --version || echo "[entrypoint] WARNING: claude still not runnable"
 
+# 第二份新版 CLI(package.json 里的 claude-code-next 别名),只给新模型用,见 cli-bin.js。
+# 装不上就不导出 CLAUDE_BIN_NEXT —— shim 自动全部走主力版本,不影响启动。
+CC_NEXT="/src/node_modules/claude-code-next"
+if [ -d "$CC_NEXT" ]; then
+  for i in 1 2 3 4 5; do
+    if "$CC_NEXT/bin/claude.exe" --version >/dev/null 2>&1; then break; fi
+    echo "[entrypoint] claude-next native binary missing, fetching (attempt $i)..."
+    (cd "$CC_NEXT" && node install.cjs) || true
+    sleep 3
+  done
+  if "$CC_NEXT/bin/claude.exe" --version; then export CLAUDE_BIN_NEXT="$CC_NEXT/bin/claude.exe"
+  else echo "[entrypoint] WARNING: claude-next not runnable, all models use main CLI"; fi
+fi
+
 unset ANTHROPIC_API_KEY   # subscription channel must win
 
 # Voice fallback transcoder: only needed if ElevenLabs can't serve Ogg/Opus
