@@ -37,6 +37,7 @@ import {
 import { createDeadTurnWatch, DEAD_ALERT_AFTER, DEAD_REALERT_MIN } from "./deadturn.js";
 import { buildAuthEnv, authMode } from "./auth-env.js";
 import { pickCliBin, parseModelList } from "./cli-bin.js";
+import { wrapTranslatingSink, makeCliTranslator } from "./think-translate.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
 // 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
@@ -72,6 +73,15 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 const CLAUDE_BIN_NEXT = process.env.CLAUDE_BIN_NEXT || "";
 const NEXT_CLI_MODELS = parseModelList(process.env.NEXT_CLI_MODELS ?? "claude-opus-5-5");
 const binFor = (model) => pickCliBin(model, { bin: CLAUDE_BIN, nextBin: CLAUDE_BIN_NEXT, nextModels: NEXT_CLI_MODELS });
+// 思考链翻中文:这些模型只给英文摘要(见 think-translate.js)。名单清空 = 关掉。
+const THINK_TRANSLATE_MODELS = parseModelList(process.env.THINK_TRANSLATE_MODELS ?? "claude-opus-5-5");
+const translateThinking = makeCliTranslator({
+  bin: CLAUDE_BIN,
+  model: process.env.THINK_TRANSLATE_MODEL || "claude-haiku-4-5",
+  env: buildAuthEnv(process.env),
+  timeoutMs: +(process.env.THINK_TRANSLATE_TIMEOUT_MS || 30000) || 30000,
+  log: (...a) => log(...a),
+});
 const MCP_CONFIG = process.env.MCP_CONFIG || ".mcp.json";
 const FORWARD_THINKING = process.env.FORWARD_THINKING !== "0";
 const AI_NAME = process.env.AI_NAME || "TA"; // 你的 AI 的名字(Bark 推送标题、模型显示名)
@@ -426,9 +436,10 @@ function handleEvent(ev) {
     }
     if (e.type === "content_block_delta") {
       if (d.type === "text_delta" && d.text) { const t = d.text.replace(/‖/g, "\n"); turn.fullText += t; turn.sse?.text(t); }
-      else if (d.type === "thinking_delta") { turn.sse?.thinking(d.thinking || d.text || ""); }
+      else if (d.type === "thinking_delta") { const t = d.thinking || d.text || ""; if (turn.sse?.thinkingRaw) turn.sse.thinkingRaw(t); else turn.sse?.thinking(t); }
       else if (d.type === "input_json_delta" && turn.obBlocks[e.index]) { turn.obBlocks[e.index].buf += d.partial_json || ""; }
     }
+    if (e.type === "content_block_stop") turn.sse?.boundary?.();   // 一段思考结束 → 翻译层整段送出
     if (e.type === "content_block_stop" && turn.obBlocks[e.index]) {
       const b = turn.obBlocks[e.index];
       delete turn.obBlocks[e.index];
@@ -563,8 +574,12 @@ function pump() {
   if (proc && (item.system !== spawnedSystem || wantModel !== spawnedModel)) { try { proc.kill(); } catch {} proc = null; }
   ensureProc(item.system, wantModel);
 
+  // 只包「真会显示思考链」的出口(Kelivo 流式 / TG);心跳、归档这些看不见思考的轮次不翻,省额度
+  const sse = item.sse?.showsThinking && THINK_TRANSLATE_MODELS.includes(wantModel)
+    ? wrapTranslatingSink(item.sse, translateThinking, { log })
+    : item.sse;
   turn = {
-    sse: item.sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {}, archiveOk: false, peakPrefix: 0,
+    sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {}, archiveOk: false, peakPrefix: 0,
     kind: item.kind || "user", archiveSrc: item.archiveSrc,
   };
   // 原文留存(压缩溜过去时的补档素材)。系统注入的轮次(自主时间/归档请求/回放)不记 ——
@@ -598,6 +613,7 @@ function makeSSE(res) {
   function close() { if (cur === null) return; send("content_block_stop", { type: "content_block_stop", index: idx }); cur = null; }
 
   return {
+    showsThinking: FORWARD_THINKING,
     text(t) { ensureStart(); open("text"); send("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: t } }); },
     thinking(t) { if (!FORWARD_THINKING || !t) return; ensureStart(); open("thinking"); send("content_block_delta", { type: "content_block_delta", index: idx, delta: { type: "thinking_delta", thinking: t } }); },
     finish(usage) { ensureStart(); close(); send("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: usage || { output_tokens: 0 } }); send("message_stop", { type: "message_stop" }); try { res.end(); } catch {} },
@@ -1327,6 +1343,7 @@ async function handleTgMessage(m) {
   tgApi("sendChatAction", { chat_id: tgChatId, action: "typing" }).catch(() => {});
   let think = "";
   const sink = {
+    showsThinking: TG_THINKING,
     text() {}, thinking(t) { if (TG_THINKING) think += t; },
     finish(_u, fullText, meta) {
       clearInterval(typing);
