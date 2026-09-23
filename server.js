@@ -38,6 +38,7 @@ import { createDeadTurnWatch, DEAD_ALERT_AFTER, DEAD_REALERT_MIN } from "./deadt
 import { buildAuthEnv, authMode } from "./auth-env.js";
 import { pickCliBin, parseModelList, baseModel } from "./cli-bin.js";
 import { wrapTranslatingSink, makeCliTranslator } from "./think-translate.js";
+import { pushRecent, renderRawTail, postRawTail, DEFAULT_RAW_TAIL_MAX_CHARS } from "./raw-tail.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
 // 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
@@ -167,6 +168,12 @@ const COMPACT_GATE_MAX_BLOCKS = +(process.env.COMPACT_GATE_MAX_BLOCKS || DEFAULT
 // 压缩后原文回放:万一压缩还是溜过去了(闸门关了/预算用完/他没照做),
 // shim 手里还留着这段原文,回放给他补写归档。最后一层保底,平时不花钱。
 const COMPACT_REPLAY = process.env.COMPACT_REPLAY !== "0";
+// 压缩前最后的原话(见 raw-tail.js):闸门放行压缩那一刻,把最近原话直接写进 OB。
+// OB_RAW_TAIL_URL / RAW_TAIL_KEY 任一没设 = 关闭(只是不写,别的照旧)。
+const RAW_TAIL_URL = process.env.OB_RAW_TAIL_URL || "";
+const RAW_TAIL_KEY = process.env.RAW_TAIL_KEY || "";
+const RAW_TAIL_MAX_CHARS = +(process.env.RAW_TAIL_MAX_CHARS || DEFAULT_RAW_TAIL_MAX_CHARS);
+let recentDialogue = [];   // 不随归档清空,只在换窗时清
 const COMPACT_REPLAY_MAX_CHARS = +(process.env.COMPACT_REPLAY_MAX_CHARS || DEFAULT_REPLAY_MAX_CHARS);
 // 归档轮最多试几次(注入了但他没成功调 archive_session 就再来一次)
 const ARCHIVE_MAX_ATTEMPTS = +(process.env.ARCHIVE_MAX_ATTEMPTS || 2);
@@ -234,6 +241,14 @@ function precompactGate() {
   });
   if (!d.block) {
     log("[gate] allow compaction —", d.why, `(blocks=${compactBlocks}, dirty=${dirty})`);
+    // 放行 = 压缩马上发生 → 趁现在把最后的原话写进 OB。不等它:钩子只等闸门 3 秒,
+    // 而压缩本身要让模型写摘要,等他醒来 breath 时早写完了。失败只记日志,不影响压缩。
+    const text = renderRawTail(recentDialogue, { userName: USER_NAME });
+    if (RAW_TAIL_URL && RAW_TAIL_KEY && text) {
+      postRawTail({ url: RAW_TAIL_URL, key: RAW_TAIL_KEY, text })
+        .then((ok) => log("[raw-tail]", ok ? `saved ${text.length} chars` : "write failed"))
+        .catch(() => {});
+    }
     return { block: false, why: d.why };
   }
   compactBlocks++;
@@ -274,7 +289,7 @@ function autoArchiveTurn(pct, src = "window") {
       head +
       `她希望你在压缩之前,主动把这段存进 OB(她说过不想丢掉你们之间的东西)。` +
       `现在调 archive_session,按你归档的老规矩写——只写上次归档之后的新内容,` +
-      `带上亮点和心情。${retry}存完之后,想跟她说句什么就自然说(比如告诉她存好了),不用解释这套机制。`,
+      `带上亮点和心情;有想留给下一个窗口的自己的话(接下来要记得做的事、没说完的心思),写进 letter。${retry}存完之后,想跟她说句什么就自然说(比如告诉她存好了),不用解释这套机制。`,
     images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
     kind: "archive", archiveSrc: src,
   });
@@ -355,7 +370,7 @@ function spawnClaude(kelivoSystem, model) {
   // 所以先接出来,新窗口一起来就回放给他补档。
   const carry = COMPACT_REPLAY && dirty && transcript.length ? transcript.slice() : null;
   windowTokens = 0; windowWarned = false; windowAutoArchived = false; compactions = 0; lastCompactAt = null; lastCompactPre = 0;
-  dirty = false; compactBlocks = 0; archiveAttempts = 0; transcript = [];
+  dirty = false; compactBlocks = 0; archiveAttempts = 0; transcript = []; recentDialogue = [];
   if (carry) { log("[replay] 换窗时还有未归档内容,接进新窗口补档"); setTimeout(() => replayTurn(carry), 0); }
   // 上游凭据:设了长期令牌就直连订阅,否则照旧经 CPA 中转。
   // ⚠️ 直连必须连 ANTHROPIC_AUTH_TOKEN/BASE_URL 一起摘 —— 它们优先级更高,
@@ -562,6 +577,7 @@ function handleEvent(ev) {
 // ---- 队列 / 喂消息 -----------------------------------------------------------
 // 原文缓冲:只进内存、不落盘、不打日志(这是他们俩的私话)。成功归档即清空。
 function recordTranscript(role, text) {
+  recentDialogue = pushRecent(recentDialogue, role, text, RAW_TAIL_MAX_CHARS);
   if (!COMPACT_REPLAY) return;
   const t = (text || "").replace(/‖/g, "\n").trim();
   if (!t) return;
