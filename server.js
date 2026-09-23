@@ -77,7 +77,8 @@ const binFor = (model) => pickCliBin(model, { bin: CLAUDE_BIN, nextBin: CLAUDE_B
 const THINK_TRANSLATE_MODELS = parseModelList(process.env.THINK_TRANSLATE_MODELS ?? "claude-opus-5-5");
 const translateThinking = makeCliTranslator({
   bin: CLAUDE_BIN,
-  model: process.env.THINK_TRANSLATE_MODEL || "claude-haiku-4-5",
+  // Sonnet 4.6:内心独白要翻出语气,Haiku 容易翻平;且它是 09-12 直连时实测能出话的模型
+  model: process.env.THINK_TRANSLATE_MODEL || "claude-sonnet-4-6",
   env: buildAuthEnv(process.env),
   timeoutMs: +(process.env.THINK_TRANSLATE_TIMEOUT_MS || 30000) || 30000,
   log: (...a) => log(...a),
