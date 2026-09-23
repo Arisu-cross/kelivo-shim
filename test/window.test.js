@@ -66,3 +66,23 @@ test("默认触发线与 Claude Code 的算法对得上(200k 上下文)", () => 
   // effectiveWindow = 200000 - min(maxOutput, 20000);  threshold = effectiveWindow - 13000
   assert.equal(DEFAULT_WINDOW_LIMIT, 200000 - 20000 - 13000);
 });
+
+import { windowLimitFor, is1m, WINDOW_LIMIT_1M, DEFAULT_WINDOW_LIMIT as BASE } from "../window.js";
+
+test("窗口上限按模型分:[1m] 走 96.7 万,其余照旧 16.7 万", () => {
+  assert.equal(WINDOW_LIMIT_1M, 1000000 - 20000 - 13000);
+  assert.equal(windowLimitFor("claude-opus-5-5[1m]"), WINDOW_LIMIT_1M);
+  assert.equal(windowLimitFor("claude-opus-5-5"), BASE);
+  assert.equal(windowLimitFor("claude-opus-4-6"), BASE);
+  assert.equal(is1m("claude-opus-5-5[1M]"), true);
+});
+
+test("【回归】5.5[1m] 聊到 15 万时不该提醒、不该自动归档(原来写死 16.7 万会在 90% 换窗)", () => {
+  const limit = windowLimitFor("claude-opus-5-5[1m]");
+  assert.ok(windowPct(150000, limit) < 85);
+});
+
+test("环境变量可以分别覆盖两条线", () => {
+  assert.equal(windowLimitFor("m[1m]", { base: 1, big: 2 }), 2);
+  assert.equal(windowLimitFor("m", { base: 1, big: 2 }), 1);
+});

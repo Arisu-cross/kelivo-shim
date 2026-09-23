@@ -25,3 +25,8 @@ test("名单清空 = 全部退回主力 CLI", () => {
 test("名单解析去空格、去空项", () => {
   assert.deepEqual(parseModelList(" a , ,b "), ["a", "b"]);
 });
+
+test("带 [1m] 后缀的模型也走新版 CLI(名单只写基础名)", () => {
+  assert.equal(pickCliBin("claude-opus-5-5[1m]", opts), "/new/claude");
+  assert.equal(pickCliBin("claude-opus-4-6[1m]", opts), "/old/claude");
+});

@@ -18,7 +18,7 @@ import { randomUUID } from "crypto";
 import { splitVoiceSegments, ttsOgg } from "./voice.js";
 import { splitStickerSegments, loadStickers, saveStickers } from "./stickers.js";
 import { splitReactionSegments, canonicalReaction } from "./reactions.js";
-import { prefixFromMessageStart, windowPct, DEFAULT_WINDOW_LIMIT } from "./window.js";
+import { prefixFromMessageStart, windowPct, windowLimitFor, DEFAULT_WINDOW_LIMIT, WINDOW_LIMIT_1M } from "./window.js";
 import { tgEsc, chunkForHtml } from "./tg-chunk.js";
 import {
   gateDecision, GATE_REASON, trimTranscript, renderReplay,
@@ -36,7 +36,7 @@ import {
 } from "./system-prompt.js";
 import { createDeadTurnWatch, DEAD_ALERT_AFTER, DEAD_REALERT_MIN } from "./deadturn.js";
 import { buildAuthEnv, authMode } from "./auth-env.js";
-import { pickCliBin, parseModelList } from "./cli-bin.js";
+import { pickCliBin, parseModelList, baseModel } from "./cli-bin.js";
 import { wrapTranslatingSink, makeCliTranslator } from "./think-translate.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
@@ -67,7 +67,7 @@ const EFFORT_OVERRIDES = Object.fromEntries(
   (process.env.THINK_EFFORT_OVERRIDES || "claude-fable-5=low")
     .split(",").map((s) => s.split("=").map((x) => x.trim())).filter((p) => p[0] && p[1])
 );
-const effortFor = (model) => EFFORT_OVERRIDES[model] || EFFORT;
+const effortFor = (model) => EFFORT_OVERRIDES[model] || EFFORT_OVERRIDES[baseModel(model)] || EFFORT;
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 // 第二份(新版)CLI,只给 NEXT_CLI_MODELS 点名的模型用;其余模型照旧走 CLAUDE_BIN。见 cli-bin.js
 const CLAUDE_BIN_NEXT = process.env.CLAUDE_BIN_NEXT || "";
@@ -147,7 +147,10 @@ if (SYSTEM_PROMPT_MODE === "replace" && process.env.SOUL_ANCHOR !== undefined)
 //   2. 窗口用量到 WINDOW_WARN_PCT 就提醒她归档换窗 —— 摘要瘦身之后,「上次归档到现在」
 //      这一段只存在于窗口里,不及时归档就真的没了。
 const COMPACT_HOOK = process.env.COMPACT_HOOK !== "0";
-const WINDOW_LIMIT = +(process.env.WINDOW_LIMIT || DEFAULT_WINDOW_LIMIT);
+// 窗口上限按当前模型算:带 [1m] 的走 WINDOW_LIMIT_1M,其余走 WINDOW_LIMIT(见 window.js)
+const WINDOW_LIMIT_BASE = +(process.env.WINDOW_LIMIT || DEFAULT_WINDOW_LIMIT);
+const WINDOW_LIMIT_BIG = +(process.env.WINDOW_LIMIT_1M || WINDOW_LIMIT_1M);
+const windowLimit = () => windowLimitFor(spawnedModel, { base: WINDOW_LIMIT_BASE, big: WINDOW_LIMIT_BIG });
 const WINDOW_WARN_PCT = +(process.env.WINDOW_WARN_PCT || 85);
 // 压缩前自动归档(owner 2026-07-31 要求):窗口到这个点,shim 主动注入一条【系统·窗口快满了】
 // 让 AI 自己在压缩吃掉记忆之前把这段存进 OB。默认 90%,在 85% 提醒她之后、硬压缩之前。
@@ -195,16 +198,17 @@ function compactSettingsArg() {
 // 刻意不往他的窗口里塞任何东西:2026-07-22 的伪系统指令事故教训 —— 运维提示走运维通道,
 // 归档还是要由她自己开口请求,那才是他们之间的约定而不是注入。
 function checkWindowUsage() {
-  if (!(WINDOW_LIMIT > 0)) return;
-  const pct = windowPct(windowTokens, WINDOW_LIMIT);
+  const limit = windowLimit();
+  if (!(limit > 0)) return;
+  const pct = windowPct(windowTokens, limit);
 
   // ① 到警戒线:提醒「她」(运维通道,不进他的窗口)
   if (!windowWarned && pct >= WINDOW_WARN_PCT) {
     windowWarned = true;
-    log("[window] usage", pct + "%", windowTokens, "/", WINDOW_LIMIT);
+    log("[window] usage", pct + "%", windowTokens, "/", limit);
     const k = (n) => Math.round(n / 1000) + "k";
     tgSend(
-      `⚠️ 窗口用到 ${pct}% 了(约 ${k(windowTokens)} / ${k(WINDOW_LIMIT)})。\n\n` +
+      `⚠️ 窗口用到 ${pct}% 了(约 ${k(windowTokens)} / ${k(limit)})。\n\n` +
       `我一会儿会自动让他把这段存一下(压缩前保底)。想换新窗口你随时说。`
     ).catch((e) => log("[tg-err]", e.message));
   }
@@ -237,7 +241,7 @@ function precompactGate() {
   // 后手:被拦下之后他不一定真的会去归档(理由文本能不能驱动他调工具,取决于 CLI 版本
   // 怎么把 reason 交给他)。所以 shim 自己也排一轮明确的归档请求 —— 两条路走通一条就行。
   // enqueue 走 busy 队列,不打断进行中的对话;archiveTurn 内部有成功校验与重试。
-  if (WINDOW_AUTO_ARCHIVE) autoArchiveTurn(windowPct(windowTokens, WINDOW_LIMIT), "gate");
+  if (WINDOW_AUTO_ARCHIVE) autoArchiveTurn(windowPct(windowTokens, windowLimit()), "gate");
   return { block: true, why: d.why, reason: GATE_REASON };
 }
 
@@ -533,7 +537,7 @@ function handleEvent(ev) {
     if (turn.kind === "archive" && !archivedOk) {
       const src = turn.archiveSrc || "window";
       log("[archive] 这一轮没写进 OB(第", archiveAttempts, "次尝试)");
-      if (archiveAttempts < ARCHIVE_MAX_ATTEMPTS) setTimeout(() => autoArchiveTurn(windowPct(windowTokens, WINDOW_LIMIT), src), 0);
+      if (archiveAttempts < ARCHIVE_MAX_ATTEMPTS) setTimeout(() => autoArchiveTurn(windowPct(windowTokens, windowLimit()), src), 0);
       else tgSend(
         "⚠️ 让他自动归档试了两次都没成功写进 OB(可能是记忆服务出问题了)。\n" +
         "压缩不会再被一直拦着,这段有丢失风险 —— 要不要你亲口让他存一次?"
@@ -576,7 +580,7 @@ function pump() {
   ensureProc(item.system, wantModel);
 
   // 只包「真会显示思考链」的出口(Kelivo 流式 / TG);心跳、归档这些看不见思考的轮次不翻,省额度
-  const sse = item.sse?.showsThinking && THINK_TRANSLATE_MODELS.includes(wantModel)
+  const sse = item.sse?.showsThinking && THINK_TRANSLATE_MODELS.includes(baseModel(wantModel))
     ? wrapTranslatingSink(item.sse, translateThinking, { log })
     : item.sse;
   turn = {
@@ -665,8 +669,8 @@ app.get("/debug", (_q, r) => r.json({
   },
   // 窗口离自动压缩还有多远 + 压缩到底发生过没有(排查时先看这里)
   window: {
-    tokens: windowTokens, limit: WINDOW_LIMIT,
-    pct: windowPct(windowTokens, WINDOW_LIMIT), warnPct: WINDOW_WARN_PCT, warned: windowWarned,
+    tokens: windowTokens, limit: windowLimit(),
+    pct: windowPct(windowTokens, windowLimit()), warnPct: WINDOW_WARN_PCT, warned: windowWarned,
     autoArchive: WINDOW_AUTO_ARCHIVE, archivePct: WINDOW_ARCHIVE_PCT, autoArchived: windowAutoArchived,
     compactHook: COMPACT_HOOK, compactions,
     lastCompactAt: lastCompactAt ? new Date(lastCompactAt).toISOString() : null,

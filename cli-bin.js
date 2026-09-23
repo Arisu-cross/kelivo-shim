@@ -7,11 +7,14 @@
 //
 // 第二份没装上(nextBin 为空)时一律走主力版本,不会因此起不来。
 
+// 去掉 Claude Code 的上下文后缀(`[1m]`):名单按基础模型名写一次,带不带后缀都认
+export const baseModel = (m) => String(m || "").replace(/\[1m\]$/i, "");
+
 export function parseModelList(s) {
   return String(s || "").split(",").map((x) => x.trim()).filter(Boolean);
 }
 
 export function pickCliBin(model, { bin, nextBin, nextModels = [] } = {}) {
-  if (nextBin && nextModels.includes(model)) return nextBin;
+  if (nextBin && nextModels.includes(baseModel(model))) return nextBin;
   return bin;
 }

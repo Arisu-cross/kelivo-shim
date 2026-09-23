@@ -10,6 +10,15 @@
 // 换模型/上限变了就用环境变量 WINDOW_LIMIT 覆盖。
 export const DEFAULT_WINDOW_LIMIT = 167000;
 
+// 1M 上下文(模型名带 `[1m]` 后缀,如 claude-opus-5-5[1m]):1000000 - 20000 - 13000。
+// 2026-09-23 用 CLI 2.1.280 对假上游实测:不带后缀的 5.5 在 17.5 万~18 万之间就压缩
+// (CLI 当它是 200k 模型);带 [1m] 到 96 万都不压,且请求带 context-1m beta。
+export const WINDOW_LIMIT_1M = 967000;
+export const is1m = (model) => /\[1m\]$/i.test(String(model || ""));
+// 这个模型的窗口按哪条线算。上限不再是一个全局常数 —— 同一个 shim 里 200k 和 1M 的模型会混着用。
+export const windowLimitFor = (model, { base = DEFAULT_WINDOW_LIMIT, big = WINDOW_LIMIT_1M } = {}) =>
+  is1m(model) ? big : base;
+
 // 一次 API 请求的「前缀大小」= 这次请求实际送进去的上下文。
 export const prefixOf = (u) =>
   (u?.input_tokens || 0) + (u?.cache_read_input_tokens || 0) + (u?.cache_creation_input_tokens || 0);
