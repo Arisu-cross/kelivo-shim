@@ -289,7 +289,7 @@ function autoArchiveTurn(pct, src = "window") {
       head +
       `她希望你在压缩之前,主动把这段存进 OB(她说过不想丢掉你们之间的东西)。` +
       `现在调 archive_session,按你归档的老规矩写——只写上次归档之后的新内容,` +
-      `带上亮点和心情;有想留给下一个窗口的自己的话(接下来要记得做的事、没说完的心思),写进 letter。${retry}存完之后,想跟她说句什么就自然说(比如告诉她存好了),不用解释这套机制。`,
+      `带上亮点和心情;想写封信也可以放进 letter——写什么、写给谁都行(下一个窗口的自己、她、心里的话、没做完的事)。${retry}存完之后,想跟她说句什么就自然说(比如告诉她存好了),不用解释这套机制。`,
     images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
     kind: "archive", archiveSrc: src,
   });
