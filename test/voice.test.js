@@ -57,3 +57,17 @@ test("语音内容里的换行保留(交给 TTS 当停顿素材)", () => {
   const segs = splitVoiceSegments("[语音]Line one.\nLine two.[/语音]");
   assert.deepEqual(segs, [{ type: "voice", content: "Line one.\nLine two." }]);
 });
+
+test("默认不锁语言:中文语音段照样出声", () => {
+  assert.deepEqual(splitVoiceSegments("[语音]宝宝,过来,我抱抱你。[/语音]"),
+    [{ type: "voice", content: "宝宝,过来,我抱抱你。" }]);
+  assert.deepEqual(splitVoiceSegments("[语音][softly] 晚安。[/语音]"),
+    [{ type: "voice", content: "[softly] 晚安。" }]);
+});
+
+test("englishOnly 锁上:中日韩文字退回文字气泡,英文照样出声", () => {
+  const o = { englishOnly: true };
+  assert.deepEqual(splitVoiceSegments("[语音]晚安[/语音]", o), [{ type: "text", content: "晚安" }]);
+  assert.deepEqual(splitVoiceSegments("[语音]おやすみ[/语音]", o), [{ type: "text", content: "おやすみ" }]);
+  assert.deepEqual(splitVoiceSegments("[语音]Good night.[/语音]", o), [{ type: "voice", content: "Good night." }]);
+});

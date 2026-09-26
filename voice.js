@@ -1,6 +1,6 @@
 // voice.js — [语音] 标记解析 + ElevenLabs TTS(Telegram 语音条用)
 //
-// 回复文本里 [语音]English content[/语音] 包住的段落转成 Ogg/Opus 语音,
+// 回复文本里 [语音]…[/语音] 包住的段落转成 Ogg/Opus 语音(任何语言,见下面 englishOnly),
 // 其余照常发文字,顺序保持混排。任何环节失败由调用方降级为文字,内容不丢。
 
 import { spawn } from "child_process";
@@ -9,22 +9,23 @@ import { spawn } from "child_process";
 // 未闭合的开标记匹配不上 → 原样当普通文本,不吞字。
 const VOICE_RE = /[\[【]\s*语音\s*[\]】]([\s\S]*?)[\[【]\s*[/／]\s*语音\s*[\]】]/g;
 
-// 语音段只走英文:这个音色是按英文调的,一套配方没法同时顾好中英文的流畅度,
-// 中文念出来会走音发飘,听着难受。所以语音段里只要出现 CJK 字符(汉字/假名/谚文),
+// 「只说英文」锁(englishOnly):开着时语音段里只要出现 CJK 字符(汉字/假名/谚文)
 // 就不送 TTS,原样退回文字气泡——内容一个字都不丢,只是这段不出声。
-// 人设里也有对应约定(语音段用英文写),这里是保底,防止偶尔写漏。
+// 由来:早先的音色是按英文调的,中文念出来会走音发飘。换成多语种模型(eleven_v3)+
+// 新音色之后,中文实测自然,所以**默认不锁**;哪天换了个念中文不行的音色,
+// 调用方传 englishOnly: true(shim 里是环境变量 VOICE_ENGLISH_ONLY=1)就锁回去。
 const CJK_RE = /[㐀-䶿一-鿿぀-ヿ가-힯]/;
 
 // 把一轮回复切成 [{ type: "text"|"voice", content }] 有序段落。
 // 空白的语音段丢弃;文字段原样保留(交给发送方自己 trim/分行)。
-export function splitVoiceSegments(text) {
+export function splitVoiceSegments(text, { englishOnly = false } = {}) {
   const segs = [];
   let last = 0;
   VOICE_RE.lastIndex = 0;
   for (let m; (m = VOICE_RE.exec(text)); ) {
     if (m.index > last) segs.push({ type: "text", content: text.slice(last, m.index) });
     const inner = m[1].trim();
-    if (inner) segs.push({ type: CJK_RE.test(inner) ? "text" : "voice", content: inner });
+    if (inner) segs.push({ type: englishOnly && CJK_RE.test(inner) ? "text" : "voice", content: inner });
     last = m.index + m[0].length;
   }
   if (last < text.length) segs.push({ type: "text", content: text.slice(last) });

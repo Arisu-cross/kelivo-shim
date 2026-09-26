@@ -698,7 +698,7 @@ app.get("/debug", (_q, r) => r.json({
     archiveAttempts, replay: COMPACT_REPLAY, replayPending,
     bufferedChars: transcript.reduce((n, e) => n + e.text.length, 0), // 只报字数,不报内容
   },
-  voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg) },
+  voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg), englishOnly: VOICE_ENGLISH_ONLY },
   ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
   stickers: { count: stickerNames().length },         // 表情包图库有几张
   // iMessage 那扇门:push=配没配 IMESSAGE_PUSH_URL;lastClient=她最后从哪扇门说话(主动的话先往那送)
@@ -1007,6 +1007,8 @@ async function tgSendBubbles(text) {
 // 以 Telegram 原生语音条(sendVoice)发出,与文字气泡按出现顺序混排。
 // 未配 key/voice_id、额度耗尽、API 报错、转码失败 → 该段原样降级为文字,内容不丢。
 const EL_KEY = process.env.ELEVENLABS_API_KEY || "";
+// 语音「只说英文」锁:默认关(新音色 + eleven_v3 念中文自然,2026-09-26 实测)。设 1 = 语音段有中日韩文字就退回文字气泡。
+const VOICE_ENGLISH_ONLY = process.env.VOICE_ENGLISH_ONLY === "1";
 
 // 音色与渲染配方:**运行时可改,不必重启**。
 // 为什么要这样:改 Zeabur 环境变量会重启容器 = 换窗口。而挑音色、调语速这种事
@@ -1125,7 +1127,7 @@ async function tgSendSticker(name) {
 async function tgSendReply(text, { replyTo = 0 } = {}) {
   if (!tgChatId || !(text || "").trim()) return;
   const segs = [];
-  for (const s of splitVoiceSegments(text)) {
+  for (const s of splitVoiceSegments(text, { englishOnly: VOICE_ENGLISH_ONLY })) {
     if (s.type !== "text") { segs.push(s); continue; }
     for (const t of splitStickerSegments(s.content, hasSticker)) {
       if (t.type === "text") segs.push(...splitReactionSegments(t.content));
