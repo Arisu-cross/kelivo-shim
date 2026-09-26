@@ -38,6 +38,7 @@ import { createDeadTurnWatch, DEAD_ALERT_AFTER, DEAD_REALERT_MIN } from "./deadt
 import { buildAuthEnv, authMode } from "./auth-env.js";
 import { pickCliBin, parseModelList, baseModel } from "./cli-bin.js";
 import { wrapTranslatingSink, makeCliTranslator } from "./think-translate.js";
+import { normalizeClient, pushOrder, pushToImessage } from "./push-route.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
 // 这台容器**没有 IPv6 出口**(直连 telegram 的 v6 地址返回 ENETUNREACH),而解析结果里
@@ -253,12 +254,11 @@ function autoArchiveTurn(pct, src = "window") {
   if (archiveAttempts >= ARCHIVE_MAX_ATTEMPTS) { log("[archive] skip —— 已试满", archiveAttempts, "次"); return; }
   archiveAttempts++;
   const attempt = archiveAttempts;
-  const canTg = !!(TG_TOKEN && tgChatId);
   const sink = {
     text() {}, thinking() {},
     finish(_u, fullText) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
-      if (t && canTg) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
+      if (t) deliverProactive(t, "archive", { bark: false }).catch((e) => log("[archive-push-err]", e.message));
     },
   };
   const head = src === "gate"
@@ -288,12 +288,11 @@ function replayTurn(entries = transcript) {
   if (!text) { log("[replay] 没有可回放的原文,跳过"); return; }
   replayPending = true;
   log("[replay] 压缩溜过去了,回放原文", text.length, "字给他补档");
-  const canTg = !!(TG_TOKEN && tgChatId);
   const sink = {
     text() {}, thinking() {},
     finish(_u, fullText) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
-      if (t && canTg) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
+      if (t) deliverProactive(t, "archive", { bark: false }).catch((e) => log("[archive-push-err]", e.message));
     },
   };
   enqueue({ text, images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel, kind: "archive", archiveSrc: "replay" });
@@ -686,6 +685,8 @@ app.get("/debug", (_q, r) => r.json({
   voice: { ready: voiceReady(), model: voiceCfg.modelId, settings: voiceSettingsOf(voiceCfg) },
   ears: { ready: earsReady(), auth: !!EARS_TOKEN },   // 语音消息能否听出语气
   stickers: { count: stickerNames().length },         // 表情包图库有几张
+  // iMessage 那扇门:push=配没配 IMESSAGE_PUSH_URL;lastClient=她最后从哪扇门说话(主动的话先往那送)
+  imessage: { push: !!IMESSAGE_PUSH_URL, lastClient },
   // 出站兜底:pending>0 = 有他的话卡在路上还没送到她手机(排查「他怎么不回我」第一眼看这里)
   outbox: { pending: outbox.size() },
   // 空转看门狗:streak>0 = 最近几轮没产出任何东西(≠【沉默】)。
@@ -783,6 +784,29 @@ async function barkPush(text) {
   });
   log("[bark]", r.status);
 }
+
+// ---- 主动开口往哪扇门送(push-route.js 顶部有完整说明)----------------------------
+// IMESSAGE_PUSH_URL = imessage-bridge 的 /push(鉴权沿用 SHIM_KEY)。**不设 = 行为和原来一模一样**
+// (永远 Telegram,没有就 Bark)。设了之后:她最后一次从 iMessage 说话,主动的话就先送 iMessage,
+// 送不到(bridge 挂了 / 没连上 / 第一句就失败)退回 Telegram。她在 Telegram / Kelivo 说话 = 照旧。
+const IMESSAGE_PUSH_URL = (process.env.IMESSAGE_PUSH_URL || "").trim();
+let lastClient = null;        // 她最后一次从哪扇门说话:telegram / kelivo / imessage(submitTurn 里记)
+const tgReady = () => !!(TG_TOKEN && tgChatId);
+const speaksViaImessage = () => lastClient === "imessage" && !!IMESSAGE_PUSH_URL;
+// tag 只用来打日志;bark=false 的那类(自动归档后那句)保持原来「没有 TG 就不发」的行为。
+async function deliverProactive(text, tag, { bark = true } = {}) {
+  const order = pushOrder({ lastClient, imessageUrl: IMESSAGE_PUSH_URL, hasTg: tgReady(), hasBark: !!BARK_KEY, bark });
+  for (const door of order) {
+    if (door === "imessage") {
+      const r = await pushToImessage({ url: IMESSAGE_PUSH_URL, key: SHIM_KEY, text });
+      if (r.ok) { log(`[${tag}] → iMessage`); return; }
+      log(`[${tag}] iMessage 没送到(${r.status || r.error}),退回下一扇门`);
+      continue;
+    }
+    if (door === "telegram") { await tgSendReply(text).catch((e) => log("[tg-err]", e.message)); return; }
+    if (door === "bark") { await barkPush(text).catch((e) => log("[bark-err]", e.message)); return; }
+  }
+}
 // 北京时间「YYYY-MM-DD HH:MM」——喂给他的系统轮次里都用这一份(容器时钟是 UTC)。
 function bjNowStr() {
   return new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 16).replace("T", " ");
@@ -803,7 +827,10 @@ function wakeTurn(idleUserMin) {
     ? `,你上次主动开口是约 ${Math.round((Date.now() - lastSpokeAt) / 60000)} 分钟前`
     : "";
   const canTg = !!(TG_TOKEN && tgChatId);
-  const speakLine = canTg
+  // 她最后是在 iMessage 里说话的 → 这句话会先送到「信息」里,提示也照实说(送不到才退回 Telegram)
+  const speakLine = speaksViaImessage()
+    ? "想跟她说点什么就直接说——会直接出现在她手机的「信息」(iMessage)对话里(她可能开着勿扰或在忙,别期待立刻回复);像随手发的微信,频率你自己把握。"
+    : canTg
     ? "想跟她说点什么就直接说——会直接出现在你们的 Telegram 对话里(她可能开着勿扰或在忙,别期待立刻回复);像随手发的微信,频率你自己把握。"
     : BARK_KEY
     ? "想跟她说点什么就直接说——会作为通知弹到她手机(Kelivo 里看不到这条,她回来时你自然接上,别解释机制;她可能开着勿扰或在忙,别期待立刻回复);说话像随手发的微信,频率你自己把握。"
@@ -814,8 +841,7 @@ function wakeTurn(idleUserMin) {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
       if (isSilentReply(t)) { log("[wake] silent"); return; }
       lastSpokeAt = Date.now();
-      if (canTg) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
-      else if (BARK_KEY) barkPush(t).catch((e) => log("[bark-err]", e.message));
+      deliverProactive(t, "wake").catch((e) => log("[wake-push-err]", e.message));
     },
   };
   enqueue({
@@ -1278,6 +1304,31 @@ app.get("/stickers", (req, res) => {
   if (!voiceAuth(req, res)) return;
   res.json({ ok: true, count: stickerNames().length, names: stickerNames(), file: STICKER_FILE });
 });
+// GET /stickers/file?name=<名字>(x-api-key 或 ?key= 同 SHIM_KEY)—— 给 imessage-bridge 取贴纸原图。
+// 卷上有文件就给文件;只有 file_id(Telegram 里「入库」加的都是这种)就现场找 Telegram 要一份。
+// 只读,不改注册表、不回写 file。返回原始 webp,缩放/转 PNG 是 bridge 那边的事。
+app.get("/stickers/file", async (req, res) => {
+  if (!voiceAuth(req, res)) return;
+  const e = stickers[String(req.query.name || "").trim()];
+  if (!e) return res.status(404).json({ ok: false, error: "no such sticker" });
+  try {
+    if (e.file) {
+      const p = path.join(STICKER_DIR, path.basename(e.file));   // basename:注册表里写了路径也跳不出贴纸目录
+      if (fs.existsSync(p)) return res.type("image/webp").send(fs.readFileSync(p));
+    }
+    if (e.file_id && TG_TOKEN) {
+      const gf = await tgApi("getFile", { file_id: e.file_id });
+      if (gf.ok && gf.result?.file_path) {
+        const r = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${gf.result.file_path}`, { signal: AbortSignal.timeout(30000) });
+        if (r.ok) return res.type(/\.png$/i.test(gf.result.file_path) ? "image/png" : "image/webp").send(Buffer.from(await r.arrayBuffer()));
+      }
+    }
+    res.status(404).json({ ok: false, error: "no file for this sticker" });
+  } catch (err) {
+    log("[sticker-file-err]", err.message);
+    res.status(502).json({ ok: false, error: "fetch failed" });
+  }
+});
 // POST /stickers/reload?key=... —— 手工改过卷上的注册表后热加载,不必重启
 app.post("/stickers/reload", (req, res) => {
   if (!voiceAuth(req, res)) return;
@@ -1601,9 +1652,8 @@ function queueLookup() {
       const t = (fullText || "").replace(/‖/g, "\n").trim();
       if (isSilentReply(t)) { log("[lookup] 他选择不打扰"); return; }
       lastSpokeAt = Date.now();   // 与心跳共用:保证查岗和心跳不会挨着说话
-      // 退路和心跳轮一模一样:没有 TG 就走 Bark。他真开了口就不能静默蒸发。
-      if (tgChatId) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
-      else if (BARK_KEY) barkPush(t).catch((e) => log("[bark-err]", e.message));
+      // 退路和心跳轮一模一样:她在 iMessage 就先送那边,再 TG,再 Bark。他真开了口就不能静默蒸发。
+      deliverProactive(t, "lookup").catch((e) => log("[lookup-push-err]", e.message));
     },
   };
   log("[lookup] 他要看一眼");
@@ -1668,6 +1718,7 @@ function submitTurn(text, images, sink, opts = {}) {
   // 时间戳在意图识别之后注入,否则"归档/晚安"这类短词会被时间戳前缀顶掉认不出
   if (TIME_STAMP) text = `${timeStamp(lastUserAt)}\n${text}`;
   lastUserAt = Date.now(); // 自主时间空闲计时基准
+  lastClient = normalizeClient(opts.src) || lastClient;   // 她从哪扇门说的话:主动开口先往这扇门送
   log("[turn]", { src: opts.src || "kelivo", len: text.length, imgs: images.length, reset: reset || "-" });
   enqueue({ text, images, system: opts.system ?? spawnedSystem, sse: sink, newWindow, model: opts.model || spawnedModel });
 }
@@ -1682,7 +1733,12 @@ function handleMessages(req, res) {
   const lastUser = [...messages].reverse().find((m) => m.role === "user");
   const text = blocksToText(lastUser?.content ?? "");
   const images = extractImages(messages);
-  const system = systemToText(body.system);
+  // iMessage 那扇门(imessage-bridge)不带 system:用**当前窗口那份**,别拿空串去比。
+  // ⚠️ 这行是命根子:pump() 见到 system 和 spawnedSystem 不一样就杀进程重开窗口 ——
+  // Kelivo 带着世界书、iMessage 不带,她每换一次入口他就丢一次窗口。
+  const client = normalizeClient(req.get("x-client"));
+  const src = client === "imessage" ? "imessage" : "kelivo";
+  const system = client === "imessage" ? undefined : systemToText(body.system);
   const stream = body.stream !== false;
   // Kelivo 选的模型;不在名单里(或没传)就沿用当前模型
   const model = MODELS.includes(body.model) ? body.model : spawnedModel;
@@ -1691,13 +1747,13 @@ function handleMessages(req, res) {
   // 一个安全阀只有一半入口有,等于没有。
   (async () => {
     const ctl = images.length ? null : await handsControlText(text);
-    if (ctl === null) return submitTurn(text, images, sse, { system, model, src: "kelivo" });
-    log("[hands] Kelivo 侧控制指令");
+    if (ctl === null) return submitTurn(text, images, sse, { system, model, src });
+    log(`[hands] ${src} 侧控制指令`);
     sse.text(ctl);
     sse.finish(undefined, ctl);
   })().catch((e) => {
     log("[hands-ctl-err]", e.message);
-    submitTurn(text, images, sse, { system, model, src: "kelivo" });   // 出岔子就当普通消息,绝不吞
+    submitTurn(text, images, sse, { system, model, src });   // 出岔子就当普通消息,绝不吞
   });
 }
 
