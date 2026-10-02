@@ -39,6 +39,7 @@ import { buildAuthEnv, authMode } from "./auth-env.js";
 import { pickCliBin, parseModelList, baseModel } from "./cli-bin.js";
 import { wrapTranslatingSink, makeCliTranslator } from "./think-translate.js";
 import { normalizeClient, pushOrder, pushToImessage } from "./push-route.js";
+import { recallMode, skipReason, coolingIds, buildUrl, formatHint, fetchRecall, observation, pushRing } from "./recall.mjs";
 import { pushRecent, renderRawTail, postRawTail, DEFAULT_RAW_TAIL_MAX_CHARS } from "./raw-tail.js";
 
 // ⚠️ 必须在任何网络请求之前执行(2026-08-19 事故)
@@ -332,6 +333,7 @@ const deadWatch = createDeadTurnWatch({
 });
 
 function spawnClaude(kelivoSystem, model) {
+  recallWindowCount = 0;   // 新窗口:自动浮现的每窗上限重新算
   // ?? 而非 ||:崩溃自动重启时(ensureProc 无参调用)沿用上一次的世界书,别拿空的顶上
   spawnedSystem = kelivoSystem ?? spawnedSystem;
   spawnedModel = model || spawnedModel || MODEL;
@@ -421,6 +423,7 @@ function handleEvent(ev) {
   // 放在 `if (!turn)` 之前:压缩在一轮的开头发生,但不依赖 turn 是否还在。
   if (ev.type === "system" && ev.subtype === "compact_boundary") {
     compactions++;
+    recallWindowCount = 0;   // 压缩后之前递的已被摘要掉,上限重新算
     lastCompactAt = Date.now();
     lastCompactPre = ev.compact_metadata?.pre_tokens || windowTokens;
     windowTokens = 0; windowWarned = false; windowAutoArchived = false;
@@ -605,9 +608,11 @@ function pump() {
   // 原文留存(压缩溜过去时的补档素材)。系统注入的轮次(自主时间/归档请求/回放)不记 ——
   // 它们不是他们俩说的话,记了只会挤掉真正该留的内容。
   if (turn.kind === "user") recordTranscript("user", item.text);
+  // promptText = 带【系统·浮现】那一行的版本(只给他看);原话留存只记她真说的(上面那行)
+  const promptText = item.promptText ?? item.text;
   const content = item.images && item.images.length
-    ? [{ type: "text", text: item.text }, ...item.images]
-    : item.text;
+    ? [{ type: "text", text: promptText }, ...item.images]
+    : promptText;
   proc.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n");
 }
 
@@ -703,6 +708,8 @@ app.get("/debug", (_q, r) => r.json({
   stickers: { count: stickerNames().length },         // 表情包图库有几张
   // iMessage 那扇门:push=配没配 IMESSAGE_PUSH_URL;lastClient=她最后从哪扇门说话(主动的话先往那送)
   imessage: { push: !!IMESSAGE_PUSH_URL, lastClient },
+  // 自动浮现:只报档位和计数(正文与她的话在带钥匙的 GET /recall 里)
+  recall: { mode: recallModeNow, configured: RECALL_CONFIGURED, windowCount: recallWindowCount, windowMax: RECALL_WINDOW_MAX },
   // 出站兜底:pending>0 = 有他的话卡在路上还没送到她手机(排查「他怎么不回我」第一眼看这里)
   outbox: { pending: outbox.size() },
   // 空转看门狗:streak>0 = 最近几轮没产出任何东西(≠【沉默】)。
@@ -806,6 +813,25 @@ async function barkPush(text) {
 // (永远 Telegram,没有就 Bark)。设了之后:她最后一次从 iMessage 说话,主动的话就先送 iMessage,
 // 送不到(bridge 挂了 / 没连上 / 第一句就失败)退回 Telegram。她在 Telegram / Kelivo 说话 = 照旧。
 const IMESSAGE_PUSH_URL = (process.env.IMESSAGE_PUSH_URL || "").trim();
+
+// ---- 自动浮现(recall.mjs 顶部有说明)--------------------------------------------
+// 她每句话前问记忆库(Ombre-Brain GET /api/recall)有没有一件确实相关的旧事,有就在她那句前加一行
+// 【系统·浮现】。RECALL_MODE:off(默认,代码路径和没这功能时逐字相同)/ observe(只记日志)/ on。
+// 运行时改档:POST /recall {"mode":"on"},不重启、不换窗;重启回到变量值。
+const RECALL_URL = (process.env.RECALL_URL || "").trim();          // https://<OB>/api/recall
+const RECALL_TOKEN = (process.env.RECALL_TOKEN || "").trim();      // = OB 的 OMBRE_RECALL_TOKEN
+const RECALL_CONFIGURED = !!(RECALL_URL && RECALL_TOKEN);
+const RECALL_TIMEOUT_MS = +(process.env.RECALL_TIMEOUT_MS || 1500) || 1500;
+const RECALL_COOLDOWN_H = +(process.env.RECALL_COOLDOWN_H || 12) || 12;
+const RECALL_MAX_CHARS = +(process.env.RECALL_MAX_CHARS || 240) || 240;
+const RECALL_MIN_AGE_H = +(process.env.RECALL_MIN_AGE_H ?? 24);
+const RECALL_WINDOW_MAX = +(process.env.RECALL_WINDOW_MAX ?? 30);   // 每个窗口最多递几次;0 = 不封顶
+let recallModeNow = recallMode(process.env.RECALL_MODE);
+let recallWindowCount = 0;            // 开新窗口 / 压缩时清零(递进去的那几行已经不在了)
+const recallCooldown = new Map();     // 桶 id → 上次递出的时刻:同一件 RECALL_COOLDOWN_H 小时内不重复
+const recallLog = [];                 // 最近 50 条「这句话配了哪件旧事」(只留开头 24 字,不带记忆正文)
+let recallChain = Promise.resolve();  // 等 OB 的那一两秒里,她紧接着发的话不许插队
+let recallPending = 0;                // 链上还有几条没交出去;>0 时连不问 OB 的消息也要排进链
 let lastClient = null;        // 她最后一次从哪扇门说话:telegram / kelivo / imessage(submitTurn 里记)
 const tgReady = () => !!(TG_TOKEN && tgChatId);
 const speaksViaImessage = () => lastClient === "imessage" && !!IMESSAGE_PUSH_URL;
@@ -1347,6 +1373,21 @@ app.get("/stickers/file", async (req, res) => {
     res.status(502).json({ ok: false, error: "fetch failed" });
   }
 });
+// GET /recall?key=<SHIM_KEY>  → 自动浮现现在哪一档 + 最近 50 条「这句话配了哪件旧事」(不含记忆正文)
+// POST /recall?key=... {"mode":"off|observe|on"} → 改档,不重启、不换窗;重启回到 RECALL_MODE 的值
+app.get("/recall", (req, res) => {
+  if (!voiceAuth(req, res)) return;
+  res.json({ ok: true, mode: recallModeNow, configured: RECALL_CONFIGURED, windowCount: recallWindowCount,
+    windowMax: RECALL_WINDOW_MAX, cooling: recallCooldown.size, log: recallLog });
+});
+app.post("/recall", (req, res) => {
+  if (!voiceAuth(req, res)) return;
+  const want = String((req.body || {}).mode || "").trim().toLowerCase();
+  if (!["off", "observe", "on"].includes(want)) return res.status(400).json({ ok: false, error: "mode = off / observe / on" });
+  recallModeNow = want;
+  log("[recall] mode →", want);
+  res.json({ ok: true, mode: recallModeNow, configured: RECALL_CONFIGURED });
+});
 // POST /stickers/reload?key=... —— 手工改过卷上的注册表后热加载,不必重启
 app.post("/stickers/reload", (req, res) => {
   if (!voiceAuth(req, res)) return;
@@ -1731,14 +1772,59 @@ function detectReset(text) {
 // Kelivo 与 Telegram 共用的进队逻辑:意图识别 → 时间戳 → enqueue
 function submitTurn(text, images, sink, opts = {}) {
   const reset = images.length ? null : detectReset(text);
+  // 自动浮现:要不要先去问 OB。off / 没配 = 同步走 finishTurn,和没这功能时逐字相同。
+  const skip = skipReason({ mode: recallModeNow, configured: RECALL_CONFIGURED, text, reset, systemTurn: false,
+                            windowCount: recallWindowCount, windowMax: RECALL_WINDOW_MAX });
+  if (skip) {
+    if (skip !== "off") pushRing(recallLog, observation({ mode: recallModeNow, text, skip }));
+    if (!recallPending) return finishTurn(text, images, sink, opts, reset, "");
+    recallPending++;                                   // 前面有一句还在等 OB:排在它后面,别插队
+    const job = recallChain.then(() => finishTurn(text, images, sink, opts, reset, ""))
+      .catch((e) => failTurn(sink, e)).finally(() => { recallPending--; });
+    recallChain = job.catch(() => {});
+    return;
+  }
+  recallPending++;
+  const job = recallChain.then(async () => {
+    let line = "";
+    try {
+      const mode = recallModeNow;
+      const url = buildUrl(RECALL_URL, { q: text, n: RECALL_MAX_CHARS, minAgeH: RECALL_MIN_AGE_H,
+                                         exclude: coolingIds(recallCooldown, Date.now(), RECALL_COOLDOWN_H) });
+      const r = await fetchRecall({ url, token: RECALL_TOKEN, timeoutMs: RECALL_TIMEOUT_MS });
+      const hint = formatHint(r.pick);
+      if (hint) {
+        recallCooldown.set(r.pick.id, Date.now());   // observe 也记冷却,日志才像真开了的样子
+        recallWindowCount++;
+        if (mode === "on") line = hint;
+      }
+      pushRing(recallLog, observation({ mode, text, res: r, injected: !!line }));
+      if (r.pick || r.error) log("[recall]", mode, r.error || r.pick.name, `${r.ms}ms`, line ? "injected" : "");
+    } catch (e) { log("[recall-err]", e.message); }
+    finishTurn(text, images, sink, opts, reset, line);
+  }).catch((e) => failTurn(sink, e)).finally(() => { recallPending--; });
+  recallChain = job.catch(() => {});
+}
+
+// 原来 submitTurn 的后半段,原样:意图识别结果 → 时间戳 → enqueue。hint = 【系统·浮现】那一行(可能为空)。
+function finishTurn(text, images, sink, opts, reset, hint) {
   // 只有 switch 才重启窗口;archive/无 都不重启。归档动作交给沈渡自己按约定完成。
   const newWindow = reset === "switch";
   // 时间戳在意图识别之后注入,否则"归档/晚安"这类短词会被时间戳前缀顶掉认不出
-  if (TIME_STAMP) text = `${timeStamp(lastUserAt)}\n${text}`;
+  const stamp = TIME_STAMP ? timeStamp(lastUserAt) : "";
+  const body = text;
+  if (stamp) text = `${stamp}\n${body}`;
+  // 浮现那一行放在时间戳之后、她的话之前;只进给他看的 promptText,不进原话留存
+  const promptText = hint ? [stamp, hint, body].filter(Boolean).join("\n") : undefined;
   lastUserAt = Date.now(); // 自主时间空闲计时基准
   lastClient = normalizeClient(opts.src) || lastClient;   // 她从哪扇门说的话:主动开口先往这扇门送
-  log("[turn]", { src: opts.src || "kelivo", len: text.length, imgs: images.length, reset: reset || "-" });
-  enqueue({ text, images, system: opts.system ?? spawnedSystem, sse: sink, newWindow, model: opts.model || spawnedModel });
+  log("[turn]", { src: opts.src || "kelivo", len: text.length, imgs: images.length, reset: reset || "-", recall: hint ? "y" : "-" });
+  enqueue({ text, promptText, images, system: opts.system ?? spawnedSystem, sse: sink, newWindow, model: opts.model || spawnedModel });
+}
+// 排进链的那句要是交不出去:同步时 express 会替我们回错,异步时不会,客户端会一直挂着 —— 自己收尾
+function failTurn(sink, e) {
+  log("[recall-chain-err]", e && e.message);
+  try { sink?.text?.("⚠️[shim] 这句没交出去,再发一次?"); sink?.finish?.(undefined, ""); } catch {}
 }
 
 function handleMessages(req, res) {
