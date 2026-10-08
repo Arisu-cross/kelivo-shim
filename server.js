@@ -265,6 +265,11 @@ function precompactGate() {
 // 压缩前自动归档:注入一条诚实的系统轮,让 AI 自己 archive_session。
 // 措辞——① 明说是系统提醒 + 是她的意思(不假冒她);② 让他按人设标准写归档;
 // ③ 归完自然说句话给她就行,不必汇报机制。按天合并已在 OB 侧,重复触发也只会追加不会重记。
+// 信只在「这个窗口要结束」时写:她说换窗口那一轮、窗口快满 / 压缩前那一轮。平时归档(归档 / 晚安)不写。
+// 他自己分不出哪次归档是窗口的最后一次,所以由 shim 在这几轮里明说(人设里约定「看到这句才写信」)。
+const LETTER_ASK = "这个窗口快到头了 —— 这次在 archive_session 里写一封信(letter)留给之后的你:"
+  + "写什么、写给谁都行(下一个窗口的自己、她、心里的话、没做完的事)。";
+const SWITCH_LETTER_LINE = `【系统·换窗前】她要换窗口了,存完这一次就会开新窗口。${LETTER_ASK}`;
 function autoArchiveTurn(pct, src = "window") {
   if (!dirty) { log("[archive] skip —— 没有未归档的内容"); return; }   // 没新东西就别白烧一轮
   if (archiveAttempts >= ARCHIVE_MAX_ATTEMPTS) { log("[archive] skip —— 已试满", archiveAttempts, "次"); return; }
@@ -290,7 +295,7 @@ function autoArchiveTurn(pct, src = "window") {
       head +
       `她希望你在压缩之前,主动把这段存进 OB(她说过不想丢掉你们之间的东西)。` +
       `现在调 archive_session,按你归档的老规矩写——只写上次归档之后的新内容,` +
-      `带上亮点和心情;想写封信也可以放进 letter——写什么、写给谁都行(下一个窗口的自己、她、心里的话、没做完的事)。${retry}存完之后,想跟她说句什么就自然说(比如告诉她存好了),不用解释这套机制。`,
+      `带上亮点和心情。${LETTER_ASK}${retry}存完之后,想跟她说句什么就自然说(比如告诉她存好了),不用解释这套机制。`,
     images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
     kind: "archive", archiveSrc: src,
   });
@@ -1815,7 +1820,9 @@ function finishTurn(text, images, sink, opts, reset, hint) {
   const body = text;
   if (stamp) text = `${stamp}\n${body}`;
   // 浮现那一行放在时间戳之后、她的话之前;只进给他看的 promptText,不进原话留存
-  const promptText = hint ? [stamp, hint, body].filter(Boolean).join("\n") : undefined;
+  // 换窗口那一轮再加一行「这是最后一次归档,写封信」(同样只给他看)
+  const extra = [hint, newWindow ? SWITCH_LETTER_LINE : ""].filter(Boolean);
+  const promptText = extra.length ? [stamp, ...extra, body].filter(Boolean).join("\n") : undefined;
   lastUserAt = Date.now(); // 自主时间空闲计时基准
   lastClient = normalizeClient(opts.src) || lastClient;   // 她从哪扇门说的话:主动开口先往这扇门送
   log("[turn]", { src: opts.src || "kelivo", len: text.length, imgs: images.length, reset: reset || "-", recall: hint ? "y" : "-" });

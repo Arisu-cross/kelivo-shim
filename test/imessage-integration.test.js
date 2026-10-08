@@ -178,3 +178,19 @@ test("GET /stickers/file:要钥匙;卷上有文件就给原图;路径跳不出�
     assert.deepEqual(names.names.sort(), ["只有句柄", "抱抱", "越狱"].sort());
   });
 });
+
+test("信只在窗口要结束时提:说「换窗口」那轮带【系统·换窗前】,「归档」「晚安」和平常的话不带", async () => {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "shim-letter-"));
+  const inputOut = path.join(work, "in.txt");
+  await withShim({ FAKE_INPUT_OUT: inputOut }, async ({ kelivo }) => {
+    const inputs = () => fs.readFileSync(inputOut, "utf8").split("\n\u0000\n").filter(Boolean);
+    await kelivo("今天好累", "");
+    await kelivo("归档", "");
+    await kelivo("晚安", "");
+    assert.ok(inputs().every((t) => !t.includes("【系统·换窗前】")), "平常的话 / 归档 / 晚安都不提写信");
+    await kelivo("换窗口", "");
+    const last = inputs().at(-1);
+    assert.match(last, /【系统·换窗前】.*letter/s);
+    assert.match(last, /换窗口$/, "她的原话还在最后");
+  });
+});
