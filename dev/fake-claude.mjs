@@ -15,6 +15,10 @@
 //                        但 subtype 照样是 success(代理把 401 伪装成合法空响应的原样)
 //   含 "【系统·查岗】"   → 这是查岗结果那一轮:**故意再写一次 [查岗]**,用来钉死防打转;
 //                        回什么由 FAKE_LOOKUP_REPLY 决定(默认写标记,设成「【沉默】」演他不打扰)
+//   含 "LEAK_NOW"       → 演 2026-10-23 那种串戏:正常回完接着编「user【时间…】」,
+//                        而且故意把标记切在两个 text_delta 之间(流式拦截要扣得住)
+//   含 "FALLBACK_NOW"   → 演 2026-10-22 那次降级:先发 model_refusal_fallback,
+//                        这一轮的 message_start 报旧模型 claude-opus-4-8
 // 另外 FAKE_PREFIX 环境变量决定 message_start 报的窗口前缀大小。
 
 // 另外两个开关,给系统提示词模式的接线测试用:
@@ -64,7 +68,13 @@ function reply(text) {
   if (text.includes("COMPACT_NOW") && !isReplay) {
     out({ type: "system", subtype: "compact_boundary", compact_metadata: { trigger: "auto", pre_tokens: 160000 } });
   }
-  out({ type: "stream_event", event: { type: "message_start", message: { usage: { input_tokens: 3, cache_read_input_tokens: PREFIX } } } });
+  const fellBack = text.includes("FALLBACK_NOW") && !isReplay;
+  if (fellBack) {
+    out({ type: "system", subtype: "model_refusal_fallback", originalModel: "claude-opus-5-5[1m]", fallbackModel: "claude-opus-4-8" });
+  }
+  out({ type: "stream_event", event: { type: "message_start", message: {
+    ...(fellBack ? { model: "claude-opus-4-8" } : {}),
+    usage: { input_tokens: 3, cache_read_input_tokens: PREFIX } } } });
 
   // 空转:正文一个字没有、usage 全零,subtype 仍是 success —— 9-02 那次三层都没报错的原样。
   if (text.includes("DEAD_NOW") && !isReplay) {
@@ -88,6 +98,9 @@ function reply(text) {
   const say = isLookup ? (process.env.FAKE_LOOKUP_REPLY ?? "还没睡?[查岗]")
     : text.includes("CHECK_NOW") ? "嗯。[查岗]"
     : wantFail ? "没存上" : wantArchive ? "存好了" : "嗯,在听";
-  out({ type: "stream_event", event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: say } } });
+  const deltas = text.includes("LEAK_NOW") && !isReplay
+    ? ["那我更得谢你。", "\n\nus", "er【时间 2026-10-23 10:33 周五】\n我投了无数次胎", "\n\n<total_tokens>15000000 tokens left</total_tokens>"]
+    : [say];
+  for (const t of deltas) out({ type: "stream_event", event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: t } } });
   out({ type: "result", subtype: "success", usage: { output_tokens: 5 } });
 }

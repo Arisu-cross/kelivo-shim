@@ -35,6 +35,7 @@ import {
   DEFAULT_SYSTEM_PROMPT_FILE,
 } from "./system-prompt.js";
 import { createDeadTurnWatch, DEAD_ALERT_AFTER, DEAD_REALERT_MIN } from "./deadturn.js";
+import { cutLeak, createLeakFilter } from "./leak-guard.js";
 import { buildAuthEnv, authMode } from "./auth-env.js";
 import { pickCliBin, parseModelList, baseModel } from "./cli-bin.js";
 import { wrapTranslatingSink, makeCliTranslator } from "./think-translate.js";
@@ -337,6 +338,27 @@ const deadWatch = createDeadTurnWatch({
   realertMin: +(process.env.DEAD_TURN_REALERT_MIN || DEAD_REALERT_MIN) || DEAD_REALERT_MIN,
 });
 
+// 串戏拦截(见 leak-guard.js 顶部):他回完话接着编「user【时间…】」那截不发出去。LEAK_GUARD=0 关掉。
+const LEAK_GUARD = process.env.LEAK_GUARD !== "0";
+let leakCount = 0, lastLeakAt = null;
+
+// 模型被降级(2026-10-22 实测):Opus 5.5 的安全审查误判 → CLI 自动把**这个窗口剩下的所有轮次**
+// 换成旧模型,不会自己换回来,shim 原来完全不知道。降级后的旧模型拿着很长的窗口容易串戏。
+// 两路都认:CLI 的 system 事件(model_refusal_fallback / model_fallback),以及每次请求
+// message_start 里实际的 model 跟启动时不一致。每个窗口只报一次,走运维通道(不进他的窗口)。
+let modelFallback = null;   // { from, to, via, at }
+function noteModelFallback(from, to, via) {
+  if (!to || baseModel(to) === baseModel(from)) return;
+  if (modelFallback) return;
+  modelFallback = { from, to, via, at: new Date().toISOString() };
+  log("[model-fallback]", from, "→", to, "via", via);
+  tgSend(
+    `⚠️ 运维提醒(不是沈渡说的):这个窗口被 Anthropic 的安全审查降级了,${baseModel(from)} → ${baseModel(to)}。\n` +
+    "降级后整个窗口都会一直用旧模型,窗口长了容易串戏(自己编一句「user【时间…】」之类)。\n" +
+    "建议:先发「归档」,等他回了带 🗄️ 的那句,再发「换窗口」—— 新窗口会用回原来的模型。"
+  ).catch((e) => log("[tg-err]", e.message));
+}
+
 function spawnClaude(kelivoSystem, model) {
   recallWindowCount = 0;   // 新窗口:自动浮现的每窗上限重新算
   // ?? 而非 ||:崩溃自动重启时(ensureProc 无参调用)沿用上一次的世界书,别拿空的顶上
@@ -376,6 +398,7 @@ function spawnClaude(kelivoSystem, model) {
   // 所以先接出来,新窗口一起来就回放给他补档。
   const carry = COMPACT_REPLAY && dirty && transcript.length ? transcript.slice() : null;
   windowTokens = 0; windowWarned = false; windowAutoArchived = false; compactions = 0; lastCompactAt = null; lastCompactPre = 0;
+  modelFallback = null;   // 新窗口用回启动时的模型
   dirty = false; compactBlocks = 0; archiveAttempts = 0; transcript = []; recentDialogue = [];
   if (carry) { log("[replay] 换窗时还有未归档内容,接进新窗口补档"); setTimeout(() => replayTurn(carry), 0); }
   // 上游凭据:设了长期令牌就直连订阅,否则照旧经 CPA 中转。
@@ -438,6 +461,11 @@ function handleEvent(ev) {
     if (dirty && COMPACT_REPLAY) replayTurn();
     return;
   }
+  if (ev.type === "system" && /fallback/.test(ev.subtype || "")) {
+    noteModelFallback(ev.originalModel || ev.original_model || spawnedModel,
+                      ev.fallbackModel || ev.fallback_model, ev.subtype);
+    return;
+  }
   if (!turn) return;
   if (ev.type === "stream_event") {
     const e = ev.event || {}, d = e.delta || {};
@@ -446,6 +474,8 @@ function handleEvent(ev) {
     if (e.type === "message_start") {
       const p = prefixFromMessageStart(e);
       if (p > turn.peakPrefix) turn.peakPrefix = p;
+      // 只看他自己这条线的请求(子任务 parent_tool_use_id 非空,可能本来就用别的模型)
+      if (!ev.parent_tool_use_id && e.message?.model) noteModelFallback(spawnedModel, e.message.model, "message_start");
     }
     if (e.type === "content_block_start") {
       const cb = e.content_block || {};
@@ -462,7 +492,11 @@ function handleEvent(ev) {
       }
     }
     if (e.type === "content_block_delta") {
-      if (d.type === "text_delta" && d.text) { const t = d.text.replace(/‖/g, "\n"); turn.fullText += t; turn.sse?.text(t); }
+      if (d.type === "text_delta" && d.text) {
+        const t = d.text.replace(/‖/g, "\n"); turn.fullText += t;
+        const out = turn.leak ? turn.leak.push(t) : t;
+        if (out) turn.sse?.text(out);
+      }
       else if (d.type === "thinking_delta") { const t = d.thinking || d.text || ""; if (turn.sse?.thinkingRaw) turn.sse.thinkingRaw(t); else turn.sse?.thinking(t); }
       else if (d.type === "input_json_delta" && turn.obBlocks[e.index]) { turn.obBlocks[e.index].buf += d.partial_json || ""; }
     }
@@ -511,6 +545,16 @@ function handleEvent(ev) {
     return;
   }
   if (ev.type === "result") {
+    // 串戏拦截:流式扣住的尾巴吐出去;全文从泄漏点截断(TG / 非流式 / 原文留存都用截过的)
+    if (turn.leak) { const tail = turn.leak.end(); if (tail) turn.sse?.text(tail); }
+    if (LEAK_GUARD) {
+      const cut = cutLeak(turn.fullText);
+      if (cut.leaked) {
+        leakCount++; lastLeakAt = new Date().toISOString();
+        log("[leak] 截掉了他接着编的下一轮", turn.fullText.length - cut.text.length, "字", "kind", turn.kind);
+        turn.fullText = cut.text;
+      }
+    }
     lastUsage = ev.usage || null; // 供 /debug 查缓存字段
     lastTurnAt = Date.now(); // 任何一轮完成都刷新了缓存 TTL,自主唤醒以此计时
     // 空转看门狗:正文空 + output token 零 = 这一轮压根没跑起来(≠ 他回【沉默】)。
@@ -609,6 +653,7 @@ function pump() {
   turn = {
     sse, fullText: "", newWindow: !!item.newWindow, obBlocks: {}, archiveOk: false, peakPrefix: 0,
     kind: item.kind || "user", archiveSrc: item.archiveSrc,
+    leak: LEAK_GUARD ? createLeakFilter() : null,
   };
   // 原文留存(压缩溜过去时的补档素材)。系统注入的轮次(自主时间/归档请求/回放)不记 ——
   // 它们不是他们俩说的话,记了只会挤掉真正该留的内容。
@@ -686,6 +731,8 @@ app.use(express.json({ limit: "100mb" }));
 app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length, auth: authMode(process.env) }));
 app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
+  // 这个窗口有没有被降级到旧模型(null = 没有);串戏拦截截过几次
+  modelFallback, leakGuard: { on: LEAK_GUARD, count: leakCount, lastAt: lastLeakAt },
   // 系统提示词:append=CC 默认那份还在(锚点压着);replace=已整段换掉(前缀少约 4800 token)
   systemPrompt: {
     mode: promptMode || "(claude 进程还没起,尚未生效)", configured: SYSTEM_PROMPT_MODE,
