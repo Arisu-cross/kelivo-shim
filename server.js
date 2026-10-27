@@ -38,6 +38,7 @@ import { createDeadTurnWatch, DEAD_ALERT_AFTER, DEAD_REALERT_MIN } from "./deadt
 import { buildAuthEnv, authMode } from "./auth-env.js";
 import { pickCliBin, parseModelList, baseModel } from "./cli-bin.js";
 import { wrapTranslatingSink, makeCliTranslator } from "./think-translate.js";
+import { splitHeart } from "./heart.js";
 import { normalizeClient, pushOrder, pushToImessage } from "./push-route.js";
 import { recallMode, skipReason, coolingIds, buildUrl, formatHint, fetchRecall, observation, pushRing } from "./recall.mjs";
 import { pushRecent, renderRawTail, postRawTail, DEFAULT_RAW_TAIL_MAX_CHARS } from "./raw-tail.js";
@@ -538,9 +539,14 @@ function handleEvent(ev) {
     // 心跳三个出口拿到的都是剥过的正文。**流式的 Kelivo 例外** —— 字已经边生成边吐出去了,
     // 和 [语音] / [贴纸] 一样,标记在 Kelivo 里会露出来(Telegram 是主通道,那边干净)。
     // 功能没开(REPORT_ON=false)时故意不剥:让标记露出来,好过安静地什么都不发生。
-    const { text: outText, wants: wantsCheck } = REPORT_ON
+    let { text: outText, wants: wantsCheck } = REPORT_ON
       ? takeCheckMarker(turn.fullText)
       : { text: turn.fullText, wants: false };
+    // 手写心声:在这里一次剥干净(和 [查岗] 同一道口),TG / Kelivo 非流式 / 心跳拿到的正文都不带标签。
+    // **流式 Kelivo 例外** —— 字已经边生成边吐出去了,标签会和 [语音]/[贴纸] 一样露出来(TG 是主通道,那边干净)。
+    // 关(HEART_ON=false)时不剥:逐字维持旧行为。剥出来的心声走 meta 交给 TG 渲染;正文里不再有它。
+    let heartOut = "";
+    if (HEART_ON) { const sp = splitHeart(outText); heartOut = sp.heart; outText = sp.body; }
     // 安全阀:想换窗但没成功归档 → 不换窗、保住窗口、提示她(宁可不换,绝不丢记忆)
     if (wantSwitch && !archivedOk) {
       turn.sse?.text("\n\n⚠️〔窗口保住了〕这次没成功归档,为防丢记忆没有换窗。想换新窗口,请先确认归档成功。");
@@ -572,7 +578,7 @@ function handleEvent(ev) {
     // 换窗那轮也不查——进程马上要被杀,查了会变成新窗口的第一句话。
     const wantsLookup = wantsCheck && turn.kind !== "lookup" && !doKill;
     turn.done = true;
-    turn.sse?.finish(usage, outText, { wantsCheck });
+    turn.sse?.finish(usage, outText, { wantsCheck, heart: heartOut });
     turn = null;
     busy = false;
     if (doKill) { log("[window] archived ok, restarting proc"); try { proc.kill(); } catch {} proc = null; }
@@ -602,8 +608,10 @@ function pump() {
   if (proc && (item.system !== spawnedSystem || wantModel !== spawnedModel)) { try { proc.kill(); } catch {} proc = null; }
   ensureProc(item.system, wantModel);
 
-  // 只包「真会显示思考链」的出口(Kelivo 流式 / TG);心跳、归档这些看不见思考的轮次不翻,省额度
-  const sse = item.sse?.showsThinking && THINK_TRANSLATE_MODELS.includes(baseModel(wantModel))
+  // 只包「真会显示思考链」的出口(Kelivo 流式 / TG);心跳、归档这些看不见思考的轮次不翻,省额度。
+  // rawNative:心声当主角时,TG 的「原生」那段原样不翻(更"原生"、也省掉每段一次的翻译额度),
+  //   中文阅读体验已由她亲手写的心声承担。其它出口(Kelivo 流式)照旧翻。
+  const sse = item.sse?.showsThinking && !item.sse?.rawNative && THINK_TRANSLATE_MODELS.includes(baseModel(wantModel))
     ? wrapTranslatingSink(item.sse, translateThinking, { log })
     : item.sse;
   turn = {
@@ -986,17 +994,31 @@ async function tgApi(method, payload) {
   return sendWithRetry(() => tgApiOnce(method, payload), { log, label: "tg-api", attempts });
 }
 const TG_THINKING = process.env.TG_THINKING !== "0"; // 思考链以折叠引用块发出,点开看;0 关闭
+// 手写心声(手写思考链 2.0):她在回复开头用 [[心声]]...[[/心声]] 亲手写一段中文内心独白。
+// 开 = TG 上「心声当主角」:心声折叠在前(静默)→ 正文(提醒)→ 原生思考+行动折叠在后(静默)。
+// 关(默认)= 逐字维持旧行为(思考折叠在前、正文在后)。部署这版代码本身零变化,等人设就位再开。
+// ⚠️ 需要人设配合:她得真在回复里写那对标签(见私有 ob-backup 的人设草案);没写就自动退回旧表现。
+const HEART_ON = process.env.HEART === "1" || process.env.HEART === "true";
+// 原生那段折叠块的小标题(折起来时能和心声那块一眼区分)。
+const HEART_NATIVE_LABEL = process.env.HEART_NATIVE_LABEL || "🔧 原生思考 · 行动轨迹";
 // 可折叠引用块:默认收起一行,点开展开——等价于 Kelivo 的 reasoning 视图。
 // ⚠️ 这个函数**绝不允许抛错**:它的调用点排在正文之前,以前它一抛,后面那条正文
 //    就再也发不出去(2026-08-13 事故:他明明回了,她那边一片安静)。
 //    思考链丢了是小事,正文丢了是大事 —— 这里的每个错误都必须自己咽下去。
-async function tgSendThinking(think) {
+// silent:静默发送(不响铃),用于心声 / 原生这类「折着备查」的块 —— 心声当主角时,
+//   原生折在正文之后,要是还响铃,最后一次通知就成了原始过程,所以这两块都压成静默,
+//   只让正文那条响。label:折叠块第一行的小标题(只加在第一块),用来区分心声块和原生块。
+async function tgSendThinking(think, { silent = false, label = "" } = {}) {
   if (!tgChatId || !think) return;
   try {
     // 超长不再截断,分成多条发。切块按转义后的长度算,见 tg-chunk.js
-    for (const part of chunkForHtml(think)) {
-      const j = await tgApi("sendMessage", { chat_id: tgChatId, parse_mode: "HTML",
-        text: `<blockquote expandable>${tgEsc(part)}</blockquote>` });
+    const parts = chunkForHtml(think);
+    for (let i = 0; i < parts.length; i++) {
+      const head = label && i === 0 ? `${tgEsc(label)}\n` : "";
+      const payload = { chat_id: tgChatId, parse_mode: "HTML",
+        text: `<blockquote expandable>${head}${tgEsc(parts[i])}</blockquote>` };
+      if (silent) payload.disable_notification = true;
+      const j = await tgApi("sendMessage", payload);
       if (!j.ok) log("[tg-think-err]", JSON.stringify(j).slice(0, 200));
     }
   } catch (e) {
@@ -1155,7 +1177,11 @@ async function tgSendSticker(name) {
 // 贴纸和回应只在文字段里找——语音段的内容整段送 TTS,不该被解析。
 // replyTo 是「她刚发的那条消息」的 message_id,只有表情回应用得上;
 // 心跳、主动开口这些没有触发消息的场合不传,回应会自己降级成气泡(见下)。
-async function tgSendReply(text, { replyTo = 0 } = {}) {
+async function tgSendReply(text, { replyTo = 0, heart = "" } = {}) {
+  // 心声当主角:若带着心声,先把它作为静默折叠引用发出去(排在正文之前),再发正文。
+  // 和正文各自兜底:心声发砸了绝不连累正文(这里咽掉错误,tgSendThinking 本身也不抛)。
+  const h = HEART_ON ? String(heart || "").replace(/‖/g, "\n").trim() : "";
+  if (h) await tgSendThinking(h, { silent: true }).catch((e) => log("[tg-heart-err]", e.message));
   if (!tgChatId || !(text || "").trim()) return;
   const segs = [];
   for (const s of splitVoiceSegments(text, { englishOnly: VOICE_ENGLISH_ONLY })) {
@@ -1464,15 +1490,26 @@ async function handleTgMessage(m) {
   let think = "";
   const sink = {
     showsThinking: TG_THINKING,
+    rawNative: HEART_ON,   // 心声当主角时,原生那段原样不翻(见 pump 里的 wrap 判断)
     text() {}, thinking(t) { if (TG_THINKING) think += t; },
-    finish(_u, fullText, meta) {
+    finish(_u, body, meta) {
       clearInterval(typing);
-      const t = (fullText || "").replace(/‖/g, "\n").trim();
+      const t = (body || "").replace(/‖/g, "\n").trim();
+      const heart = HEART_ON ? String(meta?.heart || "").trim() : "";
       (async () => {
-        // 两步各自兜底:思考链出任何问题都不许连累正文。正文是他对她说的话,优先保住。
-        if (think.trim()) await tgSendThinking(think.trim()).catch((e) => log("[tg-think-err]", e.message));
-        // 空回复兜底发个「…」,免得她那边一片安静;但「只写了个 [查岗]」是他故意不说话,不顶。
-        await tgSendReply(t || (meta?.wantsCheck ? "" : "…"), { replyTo: m.message_id }).catch((e) => log("[tg-err]", e.message));
+        // 各步各自兜底:任何一块出问题都不许连累正文。正文是他对她说的话,优先保住。
+        if (HEART_ON) {
+          // 心声当主角:心声(折叠·静默,由 tgSendReply 排在正文前)→ 正文(提醒)→ 原生思考+行动(折叠·静默,"切换"去看)。
+          // 只有心声和正文都空、又不是故意 [查岗] 时才兜底发「…」(她只写了心声 = 故意只自言自语,不顶正文)。
+          const fallback = heart || meta?.wantsCheck ? "" : "…";
+          await tgSendReply(t || fallback, { replyTo: m.message_id, heart }).catch((e) => log("[tg-err]", e.message));
+          if (think.trim()) await tgSendThinking(think.trim(), { silent: true, label: HEART_NATIVE_LABEL }).catch((e) => log("[tg-think-err]", e.message));
+        } else {
+          // 旧行为,逐字不变:思考链折叠在前,正文在后。
+          if (think.trim()) await tgSendThinking(think.trim()).catch((e) => log("[tg-think-err]", e.message));
+          // 空回复兜底发个「…」,免得她那边一片安静;但「只写了个 [查岗]」是他故意不说话,不顶。
+          await tgSendReply(t || (meta?.wantsCheck ? "" : "…"), { replyTo: m.message_id }).catch((e) => log("[tg-err]", e.message));
+        }
       })().catch((e) => log("[tg-err]", e.message));
     },
   };
