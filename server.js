@@ -278,9 +278,10 @@ function autoArchiveTurn(pct, src = "window") {
   const attempt = archiveAttempts;
   const sink = {
     text() {}, thinking() {},
-    finish(_u, fullText) {
-      const t = (fullText || "").replace(/‖/g, "\n").trim();
-      if (t) deliverProactive(t, "archive", { bark: false }).catch((e) => log("[archive-push-err]", e.message));
+    finish(_u, body, meta) {
+      const t = (body || "").replace(/‖/g, "\n").trim();
+      const heart = HEART_ON ? String(meta?.heart || "").trim() : "";
+      if (t || heart) deliverProactive(t, "archive", { bark: false, heart }).catch((e) => log("[archive-push-err]", e.message));
     },
   };
   const head = src === "gate"
@@ -312,9 +313,10 @@ function replayTurn(entries = transcript) {
   log("[replay] 压缩溜过去了,回放原文", text.length, "字给他补档");
   const sink = {
     text() {}, thinking() {},
-    finish(_u, fullText) {
-      const t = (fullText || "").replace(/‖/g, "\n").trim();
-      if (t) deliverProactive(t, "archive", { bark: false }).catch((e) => log("[archive-push-err]", e.message));
+    finish(_u, body, meta) {
+      const t = (body || "").replace(/‖/g, "\n").trim();
+      const heart = HEART_ON ? String(meta?.heart || "").trim() : "";
+      if (t || heart) deliverProactive(t, "archive", { bark: false, heart }).catch((e) => log("[archive-push-err]", e.message));
     },
   };
   enqueue({ text, images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel, kind: "archive", archiveSrc: "replay" });
@@ -849,17 +851,23 @@ let lastClient = null;        // 她最后一次从哪扇门说话:telegram / ke
 const tgReady = () => !!(TG_TOKEN && tgChatId);
 const speaksViaImessage = () => lastClient === "imessage" && !!IMESSAGE_PUSH_URL;
 // tag 只用来打日志;bark=false 的那类(自动归档后那句)保持原来「没有 TG 就不发」的行为。
-async function deliverProactive(text, tag, { bark = true } = {}) {
+// heart:主动开口时他亲手写的心声(手写思考链 2.0)。只有 TG 折得起来(静默折叠在正文前);
+//   iMessage / Bark 是纯推送,没有折叠位,只推正文——纯心声(没正文)在这两扇门发不了,落到 TG。
+async function deliverProactive(text, tag, { bark = true, heart = "" } = {}) {
+  const h = HEART_ON ? String(heart || "").replace(/‖/g, "\n").trim() : "";
+  const body = (text || "").trim();
   const order = pushOrder({ lastClient, imessageUrl: IMESSAGE_PUSH_URL, hasTg: tgReady(), hasBark: !!BARK_KEY, bark });
   for (const door of order) {
     if (door === "imessage") {
-      const r = await pushToImessage({ url: IMESSAGE_PUSH_URL, key: SHIM_KEY, text });
+      if (!body) continue;   // 纯心声没法推成 iMessage,让它落到下一扇(TG)去折叠
+      const r = await pushToImessage({ url: IMESSAGE_PUSH_URL, key: SHIM_KEY, text: body });
       if (r.ok) { log(`[${tag}] → iMessage`); return; }
       log(`[${tag}] iMessage 没送到(${r.status || r.error}),退回下一扇门`);
       continue;
     }
-    if (door === "telegram") { await tgSendReply(text).catch((e) => log("[tg-err]", e.message)); return; }
-    if (door === "bark") { await barkPush(text).catch((e) => log("[bark-err]", e.message)); return; }
+    // TG 能折:心声(静默折叠)在前,正文(响)在后;纯心声也行——就一条不吵她的静默折叠块。
+    if (door === "telegram") { await tgSendReply(body, { heart: h }).catch((e) => log("[tg-err]", e.message)); return; }
+    if (door === "bark") { if (!body) continue; await barkPush(body).catch((e) => log("[bark-err]", e.message)); return; }
   }
 }
 // 北京时间「YYYY-MM-DD HH:MM」——喂给他的系统轮次里都用这一份(容器时钟是 UTC)。
@@ -892,11 +900,13 @@ function wakeTurn(idleUserMin) {
     : "(当前没有配置推送渠道,说了她也收不到。)";
   const sink = {
     text() {}, thinking() {},
-    finish(_u, fullText) {
-      const t = (fullText || "").replace(/‖/g, "\n").trim();
-      if (isSilentReply(t)) { log("[wake] silent"); return; }
+    finish(_u, body, meta) {
+      const t = (body || "").replace(/‖/g, "\n").trim();
+      const heart = HEART_ON ? String(meta?.heart || "").trim() : "";
+      // 他写了心声 = 这轮不算沉默:哪怕没写正文,也把心声作为一条静默折叠块送过去(不吵她,就是"我在想你")。
+      if (isSilentReply(t) && !heart) { log("[wake] silent"); return; }
       lastSpokeAt = Date.now();
-      deliverProactive(t, "wake").catch((e) => log("[wake-push-err]", e.message));
+      deliverProactive(t, "wake", { heart }).catch((e) => log("[wake-push-err]", e.message));
     },
   };
   enqueue({
@@ -1666,12 +1676,13 @@ app.post("/send-file", async (req, res) => {
 function queueJobResult(j) {
   const sink = {
     text() {}, thinking() {},
-    finish(_u, fullText) {
-      const t = (fullText || "").replace(/‖/g, "\n").trim();
-      if (isSilentReply(t)) { log("[job-done] 他选择不打扰"); return; }
+    finish(_u, body, meta) {
+      const t = (body || "").replace(/‖/g, "\n").trim();
+      const heart = HEART_ON ? String(meta?.heart || "").trim() : "";
+      if (isSilentReply(t) && !heart) { log("[job-done] 他选择不打扰"); return; }
       lastSpokeAt = Date.now();   // 与心跳/查岗共用:别让几条消息挨着涌过来
-      if (tgChatId) tgSendReply(t).catch((e) => log("[tg-err]", e.message));
-      else if (BARK_KEY) barkPush(t).catch((e) => log("[bark-err]", e.message));
+      if (tgChatId) tgSendReply(t, { heart }).catch((e) => log("[tg-err]", e.message));
+      else if (BARK_KEY && t) barkPush(t).catch((e) => log("[bark-err]", e.message));   // bark 折不了心声,只推正文
     },
   };
   const status = { done: "干完了", failed: "没做成", timeout: "超时被掐了", cancelled: "被叫停了" }[j.status] || j.status;
@@ -1749,12 +1760,13 @@ function queueLookup() {
   if (!REPORT_ON) return;
   const sink = {
     text() {}, thinking() {},
-    finish(_u, fullText) {
-      const t = (fullText || "").replace(/‖/g, "\n").trim();
-      if (isSilentReply(t)) { log("[lookup] 他选择不打扰"); return; }
+    finish(_u, body, meta) {
+      const t = (body || "").replace(/‖/g, "\n").trim();
+      const heart = HEART_ON ? String(meta?.heart || "").trim() : "";
+      if (isSilentReply(t) && !heart) { log("[lookup] 他选择不打扰"); return; }
       lastSpokeAt = Date.now();   // 与心跳共用:保证查岗和心跳不会挨着说话
       // 退路和心跳轮一模一样:她在 iMessage 就先送那边,再 TG,再 Bark。他真开了口就不能静默蒸发。
-      deliverProactive(t, "lookup").catch((e) => log("[lookup-push-err]", e.message));
+      deliverProactive(t, "lookup", { heart }).catch((e) => log("[lookup-push-err]", e.message));
     },
   };
   log("[lookup] 他要看一眼");
