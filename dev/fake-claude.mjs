@@ -15,6 +15,7 @@
 //                        但 subtype 照样是 success(代理把 401 伪装成合法空响应的原样)
 //   含 "【系统·查岗】"   → 这是查岗结果那一轮:**故意再写一次 [查岗]**,用来钉死防打转;
 //                        回什么由 FAKE_LOOKUP_REPLY 决定(默认写标记,设成「【沉默】」演他不打扰)
+//   含 "RATE_NOW"       → 先吐一个 rate_limit_event(5 小时额度用了 42%)
 //   含 "LEAK_NOW"       → 演 2026-10-23 那种串戏:正常回完接着编「user【时间…】」,
 //                        而且故意把标记切在两个 text_delta 之间(流式拦截要扣得住)
 //   含 "FALLBACK_NOW"   → 演 2026-10-22 那次降级:先发 model_refusal_fallback,
@@ -67,6 +68,10 @@ function reply(text) {
   const isReplay = text.includes("原文开始");
   if (text.includes("COMPACT_NOW") && !isReplay) {
     out({ type: "system", subtype: "compact_boundary", compact_metadata: { trigger: "auto", pre_tokens: 160000 } });
+  }
+  // 额度:CLI 每轮会吐 rate_limit_event(Intertidal App 的额度卡靠它)
+  if (text.includes("RATE_NOW") && !isReplay) {
+    out({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0.42, resetsAt: 1790000000 } });
   }
   const fellBack = text.includes("FALLBACK_NOW") && !isReplay;
   if (fellBack) {

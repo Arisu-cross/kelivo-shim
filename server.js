@@ -39,7 +39,7 @@ import { cutLeak, createLeakFilter } from "./leak-guard.js";
 import { buildAuthEnv, authMode } from "./auth-env.js";
 import { pickCliBin, parseModelList, baseModel } from "./cli-bin.js";
 import { wrapTranslatingSink, makeCliTranslator } from "./think-translate.js";
-import { normalizeClient, pushOrder, pushToImessage } from "./push-route.js";
+import { normalizeClient, pushOrder, pushToImessage, BRIDGE_CLIENTS } from "./push-route.js";
 import { recallMode, skipReason, coolingIds, buildUrl, formatHint, fetchRecall, observation, pushRing } from "./recall.mjs";
 import { pushRecent, renderRawTail, postRawTail, DEFAULT_RAW_TAIL_MAX_CHARS } from "./raw-tail.js";
 
@@ -72,6 +72,13 @@ const EFFORT_OVERRIDES = Object.fromEntries(
     .split(",").map((s) => s.split("=").map((x) => x.trim())).filter((p) => p[0] && p[1])
 );
 const effortFor = (model) => EFFORT_OVERRIDES[model] || EFFORT_OVERRIDES[baseModel(model)] || EFFORT;
+// 运行时改的模型 / 思考深度(Intertidal App 的「模型」页经 tide 调 POST /brain)。重启回到环境变量的值。
+// 模型:她下一句话起生效(= 换窗,shim 照常把没归档的回放进新窗口);思考深度:下次起进程时生效。
+const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+let desiredModel = null, desiredEffort = null, spawnedEffort = null;
+// CLI 的 rate_limit_event(5 小时 / 7 天额度)。长期令牌读不了 /api/oauth/usage,只能从这里看(手册 §9)。
+const rateLimits = {};
+let rateLimitsAt = null;
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 // 第二份(新版)CLI,只给 NEXT_CLI_MODELS 点名的模型用;其余模型照旧走 CLAUDE_BIN。见 cli-bin.js
 const CLAUDE_BIN_NEXT = process.env.CLAUDE_BIN_NEXT || "";
@@ -382,7 +389,7 @@ function spawnClaude(kelivoSystem, model) {
     "--verbose",
     "--include-partial-messages",
     "--model", spawnedModel,
-    "--effort", effortFor(spawnedModel),
+    "--effort", (spawnedEffort = desiredEffort || effortFor(spawnedModel)),
     "--thinking-display", "summarized",
     ...prompt.args,
     "--mcp-config", MCP_CONFIG,
@@ -409,6 +416,10 @@ function spawnClaude(kelivoSystem, model) {
   p.stdout.on("data", onStdout);
   p.stderr.on("data", (d) => log("[claude]", d.toString().slice(0, 300)));
   p.on("close", (code) => {
+    // 换模型 / 换世界书时 pump() 先 kill 旧进程、立刻起新进程 —— 旧进程的 close 晚一拍才到。
+    // 不认这一拍的话,它会把**新**进程的 proc 清掉、把新窗口正在答的那一轮当场收尾(她收到空回复),
+    // 1.5 秒后还会再起第三个进程(新的那个成了孤儿,接着往 stdout 写)。2026-11 接 App 换模型时测出来的。
+    if (proc !== p) { log("[claude] 旧窗口退出", code); return; }
     log("[claude] exited", code);
     proc = null; busy = false;
     if (turn && !turn.done) { try { turn.sse?.finish(); } catch {} turn = null; }
@@ -445,6 +456,12 @@ const archiveCallIds = new Set(); // 本轮 archive_session 调用的 tool_use_i
 const trunc = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
 
 function handleEvent(ev) {
+  if (ev.type === "rate_limit_event" && ev.rate_limit_info) {
+    const i = ev.rate_limit_info;
+    rateLimits[i.rateLimitType || "unknown"] = { status: i.status ?? null, utilization: i.utilization ?? null, resetsAt: i.resetsAt ?? null };
+    rateLimitsAt = Date.now() / 1000;
+    return;
+  }
   // 压缩发生了 —— CLI 的硬信号,不必靠肉眼看思考链猜。
   // compact_metadata.pre_tokens = 压缩前的窗口大小(权威值,比我们的估算准)。
   // 压缩后窗口只剩「一行摘要 + 系统提示词」,所以用量归零重新数、提醒也重新武装。
@@ -728,7 +745,10 @@ const app = express();
 app.use(express.json({ limit: "100mb" }));
 // auth 只报 "direct"/"proxy" 两个字,不泄露任何值 —— 有了它,
 // 切换之后不用进容器就能确认到底换没换路(exec 会进他活着的那个容器,能少进就少进)。
-app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length, auth: authMode(process.env) }));
+// doors:这个 shim 认识哪几扇门。tide(Intertidal 的后端)开机先看这里有没有 intertidal ——
+// 老 shim 会把不认识的门当 Kelivo、拿空 system 去比 → 换窗,所以它看不到就不转发。
+app.get("/health", (_q, r) => r.json({ ok: true, model: spawnedModel, models: MODELS, busy, queued: queue.length, auth: authMode(process.env),
+  doors: ["telegram", "kelivo", ...BRIDGE_CLIENTS] }));
 app.get("/debug", (_q, r) => r.json({
   cache1h: process.env.ENABLE_PROMPT_CACHING_1H || "unset", lastUsage,
   // 这个窗口有没有被降级到旧模型(null = 没有);串戏拦截截过几次
@@ -760,6 +780,7 @@ app.get("/debug", (_q, r) => r.json({
   stickers: { count: stickerNames().length },         // 表情包图库有几张
   // iMessage 那扇门:push=配没配 IMESSAGE_PUSH_URL;lastClient=她最后从哪扇门说话(主动的话先往那送)
   imessage: { push: !!IMESSAGE_PUSH_URL, lastClient },
+  intertidal: { push: !!INTERTIDAL_PUSH_URL },
   // 自动浮现:只报档位和计数(正文与她的话在带钥匙的 GET /recall 里)
   recall: { mode: recallModeNow, configured: RECALL_CONFIGURED, windowCount: recallWindowCount, windowMax: RECALL_WINDOW_MAX },
   // 出站兜底:pending>0 = 有他的话卡在路上还没送到她手机(排查「他怎么不回我」第一眼看这里)
@@ -865,6 +886,9 @@ async function barkPush(text) {
 // (永远 Telegram,没有就 Bark)。设了之后:她最后一次从 iMessage 说话,主动的话就先送 iMessage,
 // 送不到(bridge 挂了 / 没连上 / 第一句就失败)退回 Telegram。她在 Telegram / Kelivo 说话 = 照旧。
 const IMESSAGE_PUSH_URL = (process.env.IMESSAGE_PUSH_URL || "").trim();
+// INTERTIDAL_PUSH_URL = tide(Intertidal App 的后端)的 /push,约定同上。tide 只在 App 最近来拉过时收,
+// 否则回 503 —— 这边就退回 Telegram(App 被杀掉时心跳进了 tide,她就看不到了)。不设 = 没有这扇门。
+const INTERTIDAL_PUSH_URL = (process.env.INTERTIDAL_PUSH_URL || "").trim();
 
 // ---- 自动浮现(recall.mjs 顶部有说明)--------------------------------------------
 // 她每句话前问记忆库(Ombre-Brain GET /api/recall)有没有一件确实相关的旧事,有就在她那句前加一行
@@ -887,14 +911,17 @@ let recallPending = 0;                // 链上还有几条没交出去;>0 时�
 let lastClient = null;        // 她最后一次从哪扇门说话:telegram / kelivo / imessage(submitTurn 里记)
 const tgReady = () => !!(TG_TOKEN && tgChatId);
 const speaksViaImessage = () => lastClient === "imessage" && !!IMESSAGE_PUSH_URL;
+const speaksViaIntertidal = () => lastClient === "intertidal" && !!INTERTIDAL_PUSH_URL;
 // tag 只用来打日志;bark=false 的那类(自动归档后那句)保持原来「没有 TG 就不发」的行为。
 async function deliverProactive(text, tag, { bark = true } = {}) {
-  const order = pushOrder({ lastClient, imessageUrl: IMESSAGE_PUSH_URL, hasTg: tgReady(), hasBark: !!BARK_KEY, bark });
+  const order = pushOrder({ lastClient, imessageUrl: IMESSAGE_PUSH_URL, intertidalUrl: INTERTIDAL_PUSH_URL, hasTg: tgReady(), hasBark: !!BARK_KEY, bark });
   for (const door of order) {
-    if (door === "imessage") {
-      const r = await pushToImessage({ url: IMESSAGE_PUSH_URL, key: SHIM_KEY, text });
-      if (r.ok) { log(`[${tag}] → iMessage`); return; }
-      log(`[${tag}] iMessage 没送到(${r.status || r.error}),退回下一扇门`);
+    if (door === "imessage" || door === "intertidal") {
+      const url = door === "imessage" ? IMESSAGE_PUSH_URL : INTERTIDAL_PUSH_URL;
+      const name = door === "imessage" ? "iMessage" : "Intertidal";
+      const r = await pushToImessage({ url, key: SHIM_KEY, text });
+      if (r.ok) { log(`[${tag}] → ${name}`); return; }
+      log(`[${tag}] ${name} 没送到(${r.status || r.error}),退回下一扇门`);
       continue;
     }
     if (door === "telegram") { await tgSendReply(text).catch((e) => log("[tg-err]", e.message)); return; }
@@ -924,6 +951,8 @@ function wakeTurn(idleUserMin) {
   // 她最后是在 iMessage 里说话的 → 这句话会先送到「信息」里,提示也照实说(送不到才退回 Telegram)
   const speakLine = speaksViaImessage()
     ? "想跟她说点什么就直接说——会直接出现在她手机的「信息」(iMessage)对话里(她可能开着勿扰或在忙,别期待立刻回复);像随手发的微信,频率你自己把握。"
+    : speaksViaIntertidal()
+    ? "想跟她说点什么就直接说——会出现在她手机上那个你们俩的 App(Intertidal)里;App 没开着就转到 Telegram(她可能开着勿扰或在忙,别期待立刻回复);像随手发的微信,频率你自己把握。"
     : canTg
     ? "想跟她说点什么就直接说——会直接出现在你们的 Telegram 对话里(她可能开着勿扰或在忙,别期待立刻回复);像随手发的微信,频率你自己把握。"
     : BARK_KEY
@@ -1440,6 +1469,32 @@ app.post("/recall", (req, res) => {
   log("[recall] mode →", want);
   res.json({ ok: true, mode: recallModeNow, configured: RECALL_CONFIGURED });
 });
+// GET /brain(SHIM_KEY)—— 现在跑的模型 / 思考深度、她要换成什么、额度。给 tide(Intertidal App)用。
+// POST /brain {"model"?, "effort"?} —— 换模型(她下一句起 = 换窗)/ 换思考深度(下次起进程生效)。
+app.get("/brain", (req, res) => {
+  if (!voiceAuth(req, res)) return;
+  const want = desiredModel && desiredModel !== spawnedModel ? desiredModel : null;
+  res.json({
+    ok: true, up: !!proc, model: spawnedModel, models: MODELS, pendingModel: want,
+    effort: desiredEffort || effortFor(want || spawnedModel), effortApplied: spawnedEffort, efforts: EFFORTS,
+    rateLimits, rateLimitsAt,
+  });
+});
+app.post("/brain", (req, res) => {
+  if (!voiceAuth(req, res)) return;
+  const b = req.body || {};
+  if (b.model != null) {
+    if (!MODELS.includes(b.model)) return res.status(400).json({ ok: false, error: "不在 BRAIN_MODELS 里" });
+    desiredModel = b.model;
+    log("[brain] 模型 →", b.model, b.model === spawnedModel ? "(就是现在这个)" : "(她下一句起换窗生效)");
+  }
+  if (b.effort != null) {
+    if (!EFFORTS.includes(b.effort)) return res.status(400).json({ ok: false, error: `effort = ${EFFORTS.join(" / ")}` });
+    desiredEffort = b.effort;
+    log("[brain] 思考深度 →", b.effort, "(下次起进程生效)");
+  }
+  res.json({ ok: true, model: spawnedModel, pendingModel: desiredModel !== spawnedModel ? desiredModel : null, effort: desiredEffort });
+});
 // POST /stickers/reload?key=... —— 手工改过卷上的注册表后热加载,不必重启
 app.post("/stickers/reload", (req, res) => {
   if (!voiceAuth(req, res)) return;
@@ -1873,7 +1928,7 @@ function finishTurn(text, images, sink, opts, reset, hint) {
   lastUserAt = Date.now(); // 自主时间空闲计时基准
   lastClient = normalizeClient(opts.src) || lastClient;   // 她从哪扇门说的话:主动开口先往这扇门送
   log("[turn]", { src: opts.src || "kelivo", len: text.length, imgs: images.length, reset: reset || "-", recall: hint ? "y" : "-" });
-  enqueue({ text, promptText, images, system: opts.system ?? spawnedSystem, sse: sink, newWindow, model: opts.model || spawnedModel });
+  enqueue({ text, promptText, images, system: opts.system ?? spawnedSystem, sse: sink, newWindow, model: opts.model || desiredModel || spawnedModel });
 }
 // 排进链的那句要是交不出去:同步时 express 会替我们回错,异步时不会,客户端会一直挂着 —— 自己收尾
 function failTurn(sink, e) {
@@ -1895,11 +1950,14 @@ function handleMessages(req, res) {
   // ⚠️ 这行是命根子:pump() 见到 system 和 spawnedSystem 不一样就杀进程重开窗口 ——
   // Kelivo 带着世界书、iMessage 不带,她每换一次入口他就丢一次窗口。
   const client = normalizeClient(req.get("x-client"));
-  const src = client === "imessage" ? "imessage" : "kelivo";
-  const system = client === "imessage" ? undefined : systemToText(body.system);
+  const bridged = BRIDGE_CLIENTS.has(client);           // imessage / intertidal:传声筒,不带 system
+  const src = bridged ? client : "kelivo";
+  const system = bridged ? undefined : systemToText(body.system);
   const stream = body.stream !== false;
   // Kelivo 选的模型;不在名单里(或没传)就沿用当前模型
-  const model = MODELS.includes(body.model) ? body.model : spawnedModel;
+  // Kelivo 明说了要哪个就记成「想要的」,不然下一句 TG / App 会把它拽回 desiredModel、来回换窗
+  const model = MODELS.includes(body.model) ? body.model : (desiredModel || spawnedModel);
+  if (MODELS.includes(body.model)) desiredModel = body.model;
   const sse = stream ? makeSSE(res) : makeCollector(res);
   // 急停 / 看活儿:Kelivo 这边同样管用。⚠️ 这条别删 —— 她在哪个前端说「停」都该停,
   // 一个安全阀只有一半入口有,等于没有。

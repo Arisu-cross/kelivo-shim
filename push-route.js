@@ -15,7 +15,10 @@
 export const PUSH_TIMEOUT_MS = 60000;
 
 // 她说话时记下来的「门」。只认这几个值,别的一律当 null(= 老行为)。
-const CLIENTS = new Set(["telegram", "kelivo", "imessage"]);
+// intertidal = 她手机上的 Intertidal App(后端是 tide 服务,2026-11 加的第四扇门),/push 约定和 iMessage 那边一样。
+const CLIENTS = new Set(["telegram", "kelivo", "imessage", "intertidal"]);
+// 不带 system 的门:shim 对它们沿用当前窗口那份 system,不拿空串去比(否则换一次入口丢一次窗口)。
+export const BRIDGE_CLIENTS = new Set(["imessage", "intertidal"]);
 export function normalizeClient(v) {
   const s = String(v || "").trim().toLowerCase();
   return CLIENTS.has(s) ? s : null;
@@ -24,15 +27,17 @@ export function normalizeClient(v) {
 // 这次主动开口按什么顺序试。返回 ["imessage", "telegram"] 这样的列表,调用方挨个试、成功就停。
 // hasTg:Telegram 能发(有 token 且已锁定聊天);bark:这类消息允许退到 Bark(心跳/查岗允许,归档那句不允许,
 // 保持原来的行为不变)。
-export function pushOrder({ lastClient, imessageUrl, hasTg, hasBark, bark = true }) {
+export function pushOrder({ lastClient, imessageUrl, intertidalUrl, hasTg, hasBark, bark = true }) {
   const out = [];
   if (lastClient === "imessage" && imessageUrl) out.push("imessage");
+  if (lastClient === "intertidal" && intertidalUrl) out.push("intertidal");
   if (hasTg) out.push("telegram");
   else if (bark && hasBark) out.push("bark");
   return out;
 }
 
 // 往 bridge 的 /push 送一段话。只回 true/false,不抛错 —— 失败了调用方退回下一扇门。
+// iMessage 和 Intertidal 两个 bridge 的 /push 是同一个约定,共用这一个函数。
 export async function pushToImessage({ url, key, text, timeoutMs = PUSH_TIMEOUT_MS, fetchImpl = fetch }) {
   try {
     const r = await fetchImpl(url, {

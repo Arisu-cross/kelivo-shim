@@ -46,3 +46,11 @@ test("往 bridge 推:带钥匙、2xx 才算送到,别的一律退回", async () 
   r = await pushToImessage({ url: "http://b/push", key: "k", text: "x", fetchImpl: async () => { throw new Error("ECONNREFUSED"); } });
   assert.deepEqual(r, { ok: false, error: "ECONNREFUSED" });
 });
+
+test("Intertidal(App)那扇门:她最后在 App 且配了地址才先推 App,失败退 TG;只配了 iMessage 不串门", () => {
+  assert.equal(normalizeClient("intertidal"), "intertidal");
+  assert.deepEqual(pushOrder({ lastClient: "intertidal", intertidalUrl: "http://t/push", hasTg: true, hasBark: true }), ["intertidal", "telegram"]);
+  assert.deepEqual(pushOrder({ lastClient: "intertidal", intertidalUrl: "", hasTg: true, hasBark: true }), ["telegram"]);
+  assert.deepEqual(pushOrder({ lastClient: "intertidal", imessageUrl: "http://b/push", hasTg: true }), ["telegram"]);
+  assert.deepEqual(pushOrder({ lastClient: "imessage", imessageUrl: "http://b/push", intertidalUrl: "http://t/push", hasTg: true }), ["imessage", "telegram"]);
+});
