@@ -955,7 +955,7 @@ function wakeTurn(idleUserMin) {
   const speakLine = speaksViaImessage()
     ? "想跟她说点什么就直接说——会直接出现在她手机的「信息」(iMessage)对话里(她可能开着勿扰或在忙,别期待立刻回复);像随手发的微信,频率你自己把握。"
     : speaksViaIntertidal()
-    ? "想跟她说点什么就直接说——会出现在她手机上那个你们俩的 App(Intertidal)里;App 没开着就转到 Telegram(她可能开着勿扰或在忙,别期待立刻回复);像随手发的微信,频率你自己把握。"
+    ? "想跟她说点什么就直接说——会出现在她手机上那个你们俩的 App(Neris)里;App 没开着就转到 Telegram(她可能开着勿扰或在忙,别期待立刻回复);像随手发的微信,频率你自己把握。"
     : canTg
     ? "想跟她说点什么就直接说——会直接出现在你们的 Telegram 对话里(她可能开着勿扰或在忙,别期待立刻回复);像随手发的微信,频率你自己把握。"
     : BARK_KEY
