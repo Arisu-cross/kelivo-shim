@@ -40,6 +40,7 @@ import { buildAuthEnv, authMode } from "./auth-env.js";
 import { pickCliBin, parseModelList, baseModel } from "./cli-bin.js";
 import { wrapTranslatingSink, makeCliTranslator } from "./think-translate.js";
 import { normalizeClient, pushOrder, pushToImessage, BRIDGE_CLIENTS } from "./push-route.js";
+import { normalizeSource, eventPrompt, eventImages, nightNudgeDue, nightPrompt } from "./events.js";
 import { recallMode, skipReason, coolingIds, buildUrl, formatHint, fetchRecall, observation, pushRing } from "./recall.mjs";
 import { pushRecent, renderRawTail, postRawTail, DEFAULT_RAW_TAIL_MAX_CHARS } from "./raw-tail.js";
 
@@ -611,7 +612,7 @@ function handleEvent(ev) {
     // 例外:自主时间回【沉默】的空轮不算,否则压缩后一条【沉默】就能把闸门重新拉起来。
     if (!archivedOk) {
       const said = outText.trim();
-      const silentWake = (turn.kind === "wake" || turn.kind === "lookup") && isSilentReply(said);
+      const silentWake = (turn.kind === "wake" || turn.kind === "lookup" || turn.kind === "event") && isSilentReply(said);
       if (said) recordTranscript("assistant", said);
       if (!silentWake) dirty = true;
     }
@@ -781,6 +782,8 @@ app.get("/debug", (_q, r) => r.json({
   // iMessage 那扇门:push=配没配 IMESSAGE_PUSH_URL;lastClient=她最后从哪扇门说话(主动的话先往那送)
   imessage: { push: !!IMESSAGE_PUSH_URL, lastClient },
   intertidal: { push: !!INTERTIDAL_PUSH_URL },
+  // 外部事件口子 / 熬夜提醒:只报开没开、来过几条(内容不放这个裸奔的口子)
+  events: { on: !!EVENT_TOKEN, count: eventCount, nightNudge: NIGHT_NUDGE_AFTER || null, lastNudgeNight },
   // 自动浮现:只报档位和计数(正文与她的话在带钥匙的 GET /recall 里)
   recall: { mode: recallModeNow, configured: RECALL_CONFIGURED, windowCount: recallWindowCount, windowMax: RECALL_WINDOW_MAX },
   // 出站兜底:pending>0 = 有他的话卡在路上还没送到她手机(排查「他怎么不回我」第一眼看这里)
@@ -1829,6 +1832,55 @@ function queueLookup() {
     images: [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel,
   });
 }
+
+// ---- 外部事件 + 熬夜提醒(events.js 顶部有说明)-------------------------------------
+// POST /event {source, text, images?}:collar(她醒了 / 指标不对 / 周报)、tide(朋友圈 / 天气 / 纪念日)把事实递进来,
+// 排一轮系统消息给他,他开口就按心跳那套推给她(她最后在哪扇门就推哪)。
+// 钥匙 EVENT_TOKEN **故意和 SHIM_KEY 分开**:只能递话,碰不到别的。不设 = 接口关着(503)。
+const EVENT_TOKEN = (process.env.EVENT_TOKEN || "").trim();
+// 熬夜提醒:NIGHT_NUDGE_AFTER(北京时间,如 01:30)不设 = 关。查岗(REPORT_TOKEN)没开也等于关(没有「她还醒着」的证据)。
+const NIGHT_NUDGE_AFTER = (process.env.NIGHT_NUDGE_AFTER || "").trim();
+const NIGHT_NUDGE_UNTIL = (process.env.NIGHT_NUDGE_UNTIL || "05:00").trim();
+let lastNudgeNight = null;
+let eventCount = 0;
+
+function queueSystemEvent(kind, text, images, tag) {
+  const sink = {
+    text() {}, thinking() {},
+    finish(_u, fullText) {
+      const t = (fullText || "").replace(/‖/g, "\n").trim();
+      if (isSilentReply(t)) { log(`[${tag}] 他选择不打扰`); return; }
+      lastSpokeAt = Date.now();   // 与心跳/查岗共用:别让几条消息挨着涌过来
+      deliverProactive(t, tag).catch((e) => log(`[${tag}-push-err]`, e.message));
+    },
+  };
+  enqueue({ kind, text, images: images || [], system: spawnedSystem, sse: sink, newWindow: false, model: spawnedModel });
+}
+
+app.post("/event", (req, res) => {
+  if (!EVENT_TOKEN) return res.status(503).json({ ok: false, error: "EVENT_TOKEN 未配置" });
+  const k = req.get("x-api-key") || (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
+  if (k !== EVENT_TOKEN) return res.status(401).json({ ok: false });
+  const b = req.body || {};
+  const source = normalizeSource(b.source);
+  const text = String(b.text || "").trim();
+  if (!source || !text) return res.status(400).json({ ok: false, error: "要 source 和 text" });
+  eventCount++;
+  log("[event]", source, text.length, "字", Array.isArray(b.images) ? `${b.images.length} 图` : "");
+  queueSystemEvent("event", eventPrompt(source, text, { bjNow: bjNowStr() }), eventImages(b.images), `event-${source}`);
+  res.json({ ok: true });
+});
+
+function nightTick() {
+  if (!NIGHT_NUDGE_AFTER || !REPORT_ON) return;
+  const sum = summarizeActivity(activity);
+  const r = nightNudgeDue({ activity: sum, lastNight: lastNudgeNight, after: NIGHT_NUDGE_AFTER, until: NIGHT_NUDGE_UNTIL });
+  if (!r.due) return;
+  lastNudgeNight = r.night;
+  log("[night] 很晚了她还醒着,告诉他一声");
+  queueSystemEvent("event", nightPrompt(sum, { bjNow: bjNowStr() }), [], "night");
+}
+setInterval(nightTick, 5 * 60000).unref();
 
 // Kelivo 的「模型」页拉这个列表来选模型。Anthropic /v1/models 格式。
 function listModels(_req, res) {
