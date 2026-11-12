@@ -102,7 +102,7 @@ test("她最后在 App → 心跳推 tide 的 /push;提示里说的是 App", asy
       assert.equal(t.got[0].key, KEY);
       assert.match(logs(), /\[wake\] → Intertidal/);
       const wakeText = fs.readFileSync(inputOut, "utf8").split("\n\u0000\n").find((x) => x.includes("【系统·心跳】"));
-      assert.match(wakeText, /Intertidal/);
+      assert.match(wakeText, /App\(Neris\)/);
     });
   } finally { t.close(); }
 });
